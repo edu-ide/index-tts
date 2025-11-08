@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         help="Validation manifest JSONL. Repeat to mix multiple datasets; optionally suffix with '::lang' to force a language hint.",
     )
     parser.add_argument("--tokenizer", type=Path, required=True, help="SentencePiece model path.")
+    parser.add_argument(
+        "--base-tokenizer",
+        type=Path,
+        default=None,
+        help="Original SentencePiece model used by the base checkpoint (for embedding remap).",
+    )
     parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"), help="Model config YAML.")
     parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/gpt.pth"), help="Base GPT checkpoint.")
     parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts"), help="Directory for checkpoints/logs.")
@@ -405,7 +411,13 @@ def load_tokenizer(tokenizer_path: Path) -> TextTokenizer:
     return tokenizer
 
 
-def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path, device: torch.device) -> UnifiedVoice:
+def build_model(
+    cfg_path: Path,
+    tokenizer: TextTokenizer,
+    base_checkpoint: Path,
+    base_tokenizer_path: Path | None,
+    device: torch.device,
+) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
     if cfg.gpt.number_text_tokens != vocab_size:
@@ -427,22 +439,65 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path,
         filtered_state_dict[new_key] = value
     state_dict = filtered_state_dict
 
-    resizable_keys = {
-        "text_embedding.weight": model.text_embedding.weight,
-        "text_head.weight": model.text_head.weight,
-        "text_head.bias": model.text_head.bias,
-    }
-    for key, param in resizable_keys.items():
+    base_vocab: Dict[str, int] = {}
+    if base_tokenizer_path:
+        if not base_tokenizer_path.exists():
+            raise FileNotFoundError(f"Base tokenizer not found: {base_tokenizer_path}")
+        base_tokenizer = TextTokenizer(str(base_tokenizer_path))
+        base_vocab = base_tokenizer.get_vocab()
+
+    new_vocab = tokenizer.get_vocab()
+
+    def remap_by_token(
+        key: str,
+        module_weight: torch.Tensor,
+        fallback_copy: bool = True,
+    ) -> None:
         weight = state_dict.pop(key, None)
         if weight is None:
-            continue
-        with torch.no_grad():
-            slices = tuple(min(a, b) for a, b in zip(param.shape, weight.shape))
-            if param.ndim == 1:
-                param[: slices[0]].copy_(weight[: slices[0]])
+            return
+
+        target = module_weight.detach().clone()
+        copied = 0
+
+        if base_vocab:
+            if weight.ndim == 2 and target.ndim == 2:
+                copy_cols = min(weight.size(1), target.size(1))
             else:
-                param[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
-        state_dict[key] = param.detach().clone()
+                copy_cols = None
+
+            for token, new_idx in new_vocab.items():
+                base_idx = base_vocab.get(token)
+                if base_idx is None:
+                    continue
+                if base_idx >= weight.size(0) or new_idx >= target.size(0):
+                    continue
+                if target.ndim == 1:
+                    target[new_idx] = weight[base_idx]
+                elif copy_cols is not None:
+                    target[new_idx, :copy_cols] = weight[base_idx, :copy_cols]
+                else:
+                    target[new_idx].copy_(weight[base_idx])
+                copied += 1
+
+            if copied:
+                print(f"[Info] Remapped {key}: copied {copied} shared tokens.")
+
+        if copied == 0 and fallback_copy:
+            with torch.no_grad():
+                slices = tuple(min(a, b) for a, b in zip(target.shape, weight.shape))
+                if target.ndim == 1:
+                    target[: slices[0]].copy_(weight[: slices[0]])
+                else:
+                    target[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
+
+        state_dict[key] = target
+
+    use_fallback = not base_vocab
+
+    remap_by_token("text_embedding.weight", model.text_embedding.weight, fallback_copy=use_fallback)
+    remap_by_token("text_head.weight", model.text_head.weight, fallback_copy=use_fallback)
+    remap_by_token("text_head.bias", model.text_head.bias, fallback_copy=use_fallback)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -585,7 +640,7 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(log_dir))
 
     tokenizer = load_tokenizer(args.tokenizer)
-    model = build_model(args.config, tokenizer, args.base_checkpoint, device)
+    model = build_model(args.config, tokenizer, args.base_checkpoint, args.base_tokenizer, device)
 
     train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")

@@ -568,9 +568,28 @@ def preprocess_dataset(
                     pending.clear()
                     return
 
+    total_samples: Optional[int]
+    if args.max_samples > 0:
+        total_samples = args.max_samples
+    else:
+        total_samples = None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as counter:
+                total_samples = sum(1 for line in counter if line.strip())
+            print(f"[Preprocess] Estimated {total_samples} samples from {manifest_path.name}")
+        except Exception as exc:
+            print(f"[Preprocess] Unable to estimate total samples: {exc}. Progress bar will be indefinite.")
+
     try:
         with open(manifest_path, "r", encoding="utf-8") as source:
-            for line in tqdm(source, desc=f"Preprocessing [{dataset_language}]", unit="sample"):
+            for line in tqdm(
+                source,
+                desc=f"Preprocessing [{dataset_language}]",
+                unit="sample",
+                total=total_samples,
+                smoothing=0.05,
+                dynamic_ncols=True,
+            ):
                 if args.max_samples and processed >= args.max_samples:
                     break
                 record = json.loads(line)

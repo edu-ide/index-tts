@@ -11,6 +11,16 @@
 
 The code here works and Japanese was *mostly* correct shown here: https://www.youtube.com/watch?v=47V7lS-HUpo (this model was trained on 1100 hours of audio for about 1.5 epochs)
 
+### Training References (Korean)
+
+- **전체 파이프라인 개요**: 토크나이저 확장 → 데이터 전처리 → 프롬프트/타깃 페어 생성 → GPT 미세조정 순으로 진행합니다. 관련 설명은 README 도입부와 `external/index-tts/README.md` 상단 요약을 참고하세요.
+- **환경 구축**: `docs/README_zh.md`의 “환경配置” 절(예: 123, 158, 188행 근처)이 uv 기반 가상환경, git-lfs, Hugging Face 자산 다운로드 절차를 상세히 다룹니다. 네트워크가 느릴 경우 HF 미러 설정(`docs/README_zh.md` 205행)을 권장합니다.
+- **토크나이저**: `tools/tokenizer/train_bpe.py`(12, 43행)으로 새 BPE를 학습하거나 `tools/tokenizer/extend_bpe.py`(1, 84행)로 기존 모델에 한국어 토큰을 추가할 수 있습니다.
+- **데이터 전처리**: `tools/preprocess_data.py`(9, 90, 421행)는 텍스트 정규화 → SeamlessM4T/Wav2Vec2 피처 추출 → MaskGCT 양자화 → GPT 기반 컨디셔닝·감정 벡터 추출을 수행하며, MaskGCT 가중치를 Hugging Face에서 받아옵니다(639행). 대용량 처리는 `tools/preprocess_multiproc.py`(1, 32, 98행)로 병렬 실행을 지원합니다.
+- **프롬프트/타깃 페어 생성**: `tools/build_gpt_prompt_pairs.py`(1, 68행)와 `tools/generate_gpt_pairs.py`(1, 74행)을 활용해 화자별 프롬프트·타깃 매니페스트(`gpt_pairs_*.jsonl`)를 생성합니다.
+- **GPT 미세조정**: `trainers/train_gpt_v2.py`(3, 46행)이 학습 진입점이며, 페어 매니페스트의 필수 필드 검증(200행)과 TensorBoard, 체크포인트 기록(585행)을 자동으로 처리합니다.
+- **필수 체크포인트**: `checkpoints/config.yaml`(14, 110행)이 참조하는 `gpt.pth`, `wav2vec2bert_stats.pt`, `s2mel.pth`, `feat1.pt`, `feat2.pt` 등을 Hugging Face `IndexTeam/IndexTTS-2`에서 내려받아 동일한 디렉터리 구조로 배치해야 합니다.
+
 The latest updates are done with a focus on training a multilingual model which shows promise, while mostly retaining the base model abilities to speak English and Chinese. Emotion finetuning has not been investigated yet and it seems that full finetuning does not mess up the base emotion capabilities of the model.
 
 <div align="center">

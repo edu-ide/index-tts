@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Utility script to train a SentencePiece BPE tokenizer on the Japanese corpus.
+Utility script to train a SentencePiece BPE tokenizer on arbitrary manifests.
 
 Example:
     python tools/tokenizer/train_bpe.py \\
-        --manifest JA_yodas_dataset/ja_yodas_train.jsonl \\
-        --output-prefix checkpoints/japanese_bpe \\
-        --vocab-size 12000
+        --manifest datasets/ko_manifest.jsonl \\
+        --output-prefix checkpoints/korean_bpe \\
+        --vocab-size 12000 \\
+        --language ko
 """
 
 import argparse
@@ -15,6 +16,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import List
 
 import sentencepiece as spm
 
@@ -22,7 +24,7 @@ from indextts.utils.front import TextNormalizer
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Japanese BPE tokenizer with SentencePiece.")
+    parser = argparse.ArgumentParser(description="Train a SentencePiece BPE tokenizer.")
     parser.add_argument(
         "--manifest",
         nargs="+",
@@ -54,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         help="SentencePiece model type.",
     )
     parser.add_argument(
+        "--language",
+        type=str,
+        default="ja",
+        help="Language hint passed to the TextNormalizer/TextTokenizer (e.g. 'ja', 'ko').",
+    )
+    parser.add_argument(
         "--input-sentence-size",
         type=int,
         default=0,
@@ -64,11 +72,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable byte fallback to avoid <unk> for unseen characters.",
     )
+    parser.add_argument(
+        "--user-defined-symbol",
+        action="append",
+        default=[],
+        help="SentencePiece user-defined symbols to reserve (repeatable).",
+    )
     return parser.parse_args()
 
 
-def iter_texts(manifests: list[Path]) -> tuple[int, int, Path]:
-    normalizer = TextNormalizer(preferred_language="ja")
+def iter_texts(manifests: List[Path], language: str) -> tuple[int, int, Path]:
+    normalizer = TextNormalizer(preferred_language=language)
     normalizer.load()
 
     num_samples = 0
@@ -83,7 +97,7 @@ def iter_texts(manifests: list[Path]) -> tuple[int, int, Path]:
                             continue
                         payload = json.loads(line)
                         text = payload.get("text", "")
-                        text = normalizer.normalize(text, language="ja")
+                        text = normalizer.normalize(text, language=language)
                         if not text:
                             num_empty += 1
                             continue
@@ -104,7 +118,7 @@ def train_tokenizer(args: argparse.Namespace) -> None:
     output_prefix = args.output_prefix.expanduser().resolve()
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    num_samples, num_empty, corpus_path = iter_texts(manifests)
+    num_samples, num_empty, corpus_path = iter_texts(manifests, args.language)
     if num_samples == 0:
         raise RuntimeError("No non-empty samples found. Cannot train tokenizer.")
 
@@ -123,6 +137,8 @@ def train_tokenizer(args: argparse.Namespace) -> None:
         "byte_fallback": args.byte_fallback,
         "train_extremely_large_corpus": True,
     }
+    if args.user_defined_symbol:
+        spm_kwargs["user_defined_symbols"] = ",".join(args.user_defined_symbol)
 
     print(f"[Tokenizer] Training on {num_samples} samples (skipped {num_empty}).")
     try:
