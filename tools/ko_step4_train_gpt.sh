@@ -92,10 +92,120 @@ echo "[KO-STEP4] train manifests=${TRAIN_FLAGS[*]}"
 echo "[KO-STEP4] val manifests=${VAL_FLAGS[*]}"
 echo "[KO-STEP4] output-dir=${OUTPUT_DIR}"
 
+# Best checkpoint 모니터링 시작
+cat > /tmp/monitor_best_checkpoint.py << 'EOF'
+#!/usr/bin/env python3
+"""
+Best checkpoint 모니터링 및 자동 저장
+TensorBoard 로그를 실시간으로 체크하여 최고 성능 체크포인트를 별도 저장
+"""
+import time
+import shutil
+from pathlib import Path
+from tensorboard.backend.event_processing import event_accumulator
+
+log_dir = Path("/mnt/sda1/models/index-tts-ko/checkpoints/logs")
+ckpt_dir = Path("/mnt/sda1/models/index-tts-ko/checkpoints")
+best_ckpt_path = ckpt_dir / "best_model.pth"
+best_loss_file = ckpt_dir / "best_loss.txt"
+
+# 초기 best loss
+if best_loss_file.exists():
+    with open(best_loss_file, 'r') as f:
+        best_loss = float(f.read().strip())
+else:
+    best_loss = float('inf')
+
+print(f"Best checkpoint monitor started (current best: {best_loss:.4f})")
+
+def get_latest_run():
+    runs = sorted(log_dir.glob("run_*"))
+    return runs[-1] if runs else None
+
+last_checked_step = -1
+
+while True:
+    try:
+        latest_run = get_latest_run()
+        if not latest_run:
+            time.sleep(30)
+            continue
+
+        ea = event_accumulator.EventAccumulator(str(latest_run))
+        ea.Reload()
+
+        # Validation loss 확인 (없으면 train loss 사용)
+        loss_tag = 'val/mel_loss' if 'val/mel_loss' in ea.Tags()['scalars'] else 'train/mel_loss'
+
+        if loss_tag not in ea.Tags()['scalars']:
+            time.sleep(30)
+            continue
+
+        events = ea.Scalars(loss_tag)
+        if not events:
+            time.sleep(30)
+            continue
+
+        latest_event = events[-1]
+
+        if latest_event.step == last_checked_step:
+            time.sleep(30)
+            continue
+
+        last_checked_step = latest_event.step
+        current_loss = latest_event.value
+
+        # Best 업데이트 확인
+        if current_loss < best_loss:
+            best_loss = current_loss
+
+            # 해당 step의 체크포인트 찾기
+            step_ckpt = ckpt_dir / f"model_step{latest_event.step}.pth"
+
+            # 1000 step 단위로 저장되므로, 가장 가까운 step 찾기
+            rounded_step = (latest_event.step // 1000) * 1000
+            step_ckpt = ckpt_dir / f"model_step{rounded_step}.pth"
+
+            if step_ckpt.exists():
+                # Best checkpoint 복사
+                shutil.copy2(step_ckpt, best_ckpt_path)
+
+                # Best loss 저장
+                with open(best_loss_file, 'w') as f:
+                    f.write(f"{best_loss:.6f}")
+
+                print(f"\n🎉 New best! Step {latest_event.step}: {current_loss:.4f} (saved to best_model.pth)\n")
+            else:
+                print(f"⚠️  New best found but checkpoint not yet saved: step {latest_event.step}")
+
+        time.sleep(30)
+
+    except KeyboardInterrupt:
+        print("\nMonitor stopped")
+        break
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(30)
+EOF
+
+nohup python3 /tmp/monitor_best_checkpoint.py > /tmp/best_ckpt_monitor.log 2>&1 &
+MONITOR_PID=$!
+echo "✅ Best checkpoint monitor started (PID: ${MONITOR_PID})"
+echo "   Log: /tmp/best_ckpt_monitor.log"
+echo ""
+
 if [[ "${TIMEOUT_SECS}" -gt 0 ]]; then
   timeout "${TIMEOUT_SECS}" "${CMD[@]}"
 else
   "${CMD[@]}"
 fi
 
+# 학습 완료 후 모니터 종료
+kill ${MONITOR_PID} 2>/dev/null || true
+echo ""
 echo "[KO-STEP4] GPT fine-tuning command finished."
+echo ""
+if [[ -f "/mnt/sda1/models/index-tts-ko/checkpoints/best_loss.txt" ]]; then
+  echo "🏆 Best mel_loss: $(cat /mnt/sda1/models/index-tts-ko/checkpoints/best_loss.txt)"
+  echo "📁 Best checkpoint: /mnt/sda1/models/index-tts-ko/checkpoints/best_model.pth"
+fi

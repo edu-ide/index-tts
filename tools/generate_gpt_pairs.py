@@ -21,7 +21,6 @@ from build_gpt_prompt_pairs import (
     Sample,
     build_pairs,
     group_by_speaker,
-    read_manifest,
 )
 
 
@@ -112,6 +111,47 @@ def write_pairs(pairs: Sequence[dict], path: Path) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def load_manifest_with_report(manifest_path: Path) -> tuple[List[Sample], dict]:
+    """Parse a manifest JSONL while collecting invalid line info."""
+
+    samples: List[Sample] = []
+    errors: List[dict] = []
+    total_lines = 0
+    blank_lines = 0
+
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, 1):
+            total_lines += 1
+            line = raw_line.strip()
+            if not line:
+                blank_lines += 1
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(
+                    {
+                        "line": line_no,
+                        "error": exc.msg,
+                        "column": exc.colno,
+                        "char": exc.pos,
+                        "snippet": raw_line.strip()[:160],
+                    }
+                )
+                continue
+            samples.append(Sample(record))
+
+    report = {
+        "path": str(manifest_path),
+        "total_lines": total_lines,
+        "blank_lines": blank_lines,
+        "valid_records": len(samples),
+        "skipped_records": len(errors),
+        "errors": errors,
+    }
+    return samples, report
+
+
 def generate_for_manifest(
     manifest_path: Path,
     output_path: Path,
@@ -120,8 +160,8 @@ def generate_for_manifest(
     min_text_len: int,
     min_code_len: int,
     max_pairs: Optional[int],
-) -> int:
-    samples: List[Sample] = read_manifest(manifest_path)
+) -> tuple[int, dict]:
+    samples, manifest_report = load_manifest_with_report(manifest_path)
     if not samples:
         raise RuntimeError(f"No entries found in manifest: {manifest_path}")
     grouped = group_by_speaker(samples)
@@ -135,7 +175,7 @@ def generate_for_manifest(
     if not pairs:
         raise RuntimeError(f"No valid pairs generated for {manifest_path}")
     write_pairs(pairs, output_path)
-    return len(pairs)
+    return len(pairs), manifest_report
 
 
 def main() -> None:
@@ -169,7 +209,7 @@ def main() -> None:
             )
 
         print(f"[Generate] Dataset: {dataset_dir}")
-        train_count = generate_for_manifest(
+        train_count, train_report = generate_for_manifest(
             train_manifest,
             train_output,
             pairs_per_target=args.pairs_per_target,
@@ -177,9 +217,14 @@ def main() -> None:
             min_code_len=args.min_code_len,
             max_pairs=max_pairs,
         )
+        if train_report["skipped_records"]:
+            print(
+                f"  ! Skipped {train_report['skipped_records']} malformed train record(s); "
+                "details saved to report.json"
+            )
         print(f"  - Wrote {train_count} train pairs -> {train_output.name}")
 
-        val_count = generate_for_manifest(
+        val_count, val_report = generate_for_manifest(
             val_manifest,
             val_output,
             pairs_per_target=args.pairs_per_target,
@@ -187,7 +232,22 @@ def main() -> None:
             min_code_len=args.min_code_len,
             max_pairs=max_pairs,
         )
+        if val_report["skipped_records"]:
+            print(
+                f"  ! Skipped {val_report['skipped_records']} malformed val record(s); "
+                "details saved to report.json"
+            )
         print(f"  - Wrote {val_count} val pairs -> {val_output.name}")
+
+        report_payload = {
+            "dataset": str(dataset_dir),
+            "train_manifest": train_report,
+            "val_manifest": val_report,
+        }
+        report_path = dataset_dir / "report.json"
+        with report_path.open("w", encoding="utf-8") as handle:
+            json.dump(report_payload, handle, ensure_ascii=False, indent=2)
+        print(f"  - Validation report -> {report_path}")
 
 
 if __name__ == "__main__":

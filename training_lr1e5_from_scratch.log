@@ -1,0 +1,178 @@
+================================================================
+🚀 최적화된 한국어 GPT 학습 - RTX 4090 24GB
+================================================================
+
+📊 하이퍼파라미터 (IndexTTS2 논문 기반):
+  - GPU: RTX 4090 24GB
+  - Batch Size: 8 (메모리 안전)
+  - Gradient Accumulation: 8 (실효 batch 64)
+  - Tokens/Batch: ~34,694 (Transformer 논문 수준)
+  - Learning Rate: 2e-4 (논문 권장값)
+  - Warmup Steps: 30,000
+  - Epochs: 2
+  - Gradient Clip: 0.5
+
+💡 Gradient Accumulation 사용:
+  - 메모리는 batch 8 수준 유지 (안전)
+  - 학습 효과는 batch 64와 동일
+  - Transformer 논문 기준(~25k tokens) 달성 ✅
+
+🎯 목표:
+  - text_loss < 0.9
+  - mel_loss < 3.5
+  - 학습 시간: ~30-35시간
+
+📚 참고문헌:
+  - IndexTTS2 (arXiv:2506.21619v2) - LR 2e-4, AdamW
+  - Attention is All You Need (Vaswani+ 2017) - ~25k tokens/batch
+  - Decoupled Weight Decay (Loshchilov+ 2019) - AdamW optimizer
+
+⚠️  주의사항:
+  - 현재: 1-stage 학습 (ConformerEncoder + PerceiverResampler)
+  - 논문: 3-stage 학습 (basic → GRL emotion → fine-tune)
+  - GRL 미구현으로 speaker-emotion disentanglement 제한적
+  - Phase 1 baseline 확보 후 GRL 추가 예정
+
+================================================================
+✅ GPU: NVIDIA GeForce RTX 4090
+✅ VRAM: 24564MB
+
+
+
+🎬 학습을 시작합니다...
+📊 TensorBoard: http://localhost:6006
+📁 체크포인트: /mnt/sda1/models/index-tts-ko/checkpoints/
+
+💡 Gradient Accumulation 활성화:
+   - Forward/Backward 8회 실행 후 1회 업데이트
+   - 약간 느리지만 Transformer 논문 기준 달성
+
+[KO-STEP4] train manifests=--train-manifest /mnt/sda1/emilia-yodas/KO_preprocessed/gpt_pairs_train.jsonl::ko
+[KO-STEP4] val manifests=--val-manifest /mnt/sda1/emilia-yodas/KO_preprocessed/gpt_pairs_val.jsonl::ko
+[KO-STEP4] output-dir=/mnt/sda1/models/index-tts-ko/checkpoints
+✅ Best checkpoint monitor started (PID: 2905665)
+   Log: /tmp/best_ckpt_monitor.log
+
+2025-11-20 12:48:46,247 WETEXT INFO found existing fst: /mnt/sdc1/ws/workspace/monorepo/external/index-tts/indextts/utils/tagger_cache/zh_tn_tagger.fst
+2025-11-20 12:48:46,247 WETEXT INFO                     /mnt/sdc1/ws/workspace/monorepo/external/index-tts/indextts/utils/tagger_cache/zh_tn_verbalizer.fst
+2025-11-20 12:48:46,247 WETEXT INFO skip building fst for zh_normalizer ...
+2025-11-20 12:48:46,402 WETEXT INFO found existing fst: /mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/tn/en_tn_tagger.fst
+2025-11-20 12:48:46,403 WETEXT INFO                     /mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/tn/en_tn_verbalizer.fst
+2025-11-20 12:48:46,403 WETEXT INFO skip building fst for en_normalizer ...
+/mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/transformers/configuration_utils.py:312: UserWarning: Passing `gradient_checkpointing` to a config initialization is deprecated and will be removed in v5 Transformers. Using `model.gradient_checkpointing_enable()` instead, or if you are using the `Trainer` API, pass `gradient_checkpointing=True` in your `TrainingArguments`.
+  warnings.warn(
+[Info] Aim initialized: experiment=indextts-korean, run=run_20251120_124845
+[Info] View results: aim up --repo .aim
+[Info] Remapped text_embedding.weight: copied 61 shared tokens.
+[Info] Remapped text_head.weight: copied 61 shared tokens.
+[Info] Remapped text_head.bias: copied 61 shared tokens.
+[Info] Loading training manifests...
+[Info] Parsing manifest /mnt/sda1/emilia-yodas/KO_preprocessed/gpt_pairs_train.jsonl ...
+  • processed 10,000 entries (kept 10,000) in gpt_pairs_train.jsonl
+  • processed 20,000 entries (kept 20,000) in gpt_pairs_train.jsonl
+  • processed 30,000 entries (kept 30,000) in gpt_pairs_train.jsonl
+  • processed 40,000 entries (kept 40,000) in gpt_pairs_train.jsonl
+  • processed 50,000 entries (kept 50,000) in gpt_pairs_train.jsonl
+  • processed 60,000 entries (kept 60,000) in gpt_pairs_train.jsonl
+  • processed 70,000 entries (kept 70,000) in gpt_pairs_train.jsonl
+  • processed 80,000 entries (kept 80,000) in gpt_pairs_train.jsonl
+  • processed 90,000 entries (kept 90,000) in gpt_pairs_train.jsonl
+  • processed 100,000 entries (kept 100,000) in gpt_pairs_train.jsonl
+  • processed 110,000 entries (kept 110,000) in gpt_pairs_train.jsonl
+  • processed 120,000 entries (kept 120,000) in gpt_pairs_train.jsonl
+  • processed 130,000 entries (kept 130,000) in gpt_pairs_train.jsonl
+  • processed 140,000 entries (kept 140,000) in gpt_pairs_train.jsonl
+  • processed 150,000 entries (kept 150,000) in gpt_pairs_train.jsonl
+  • processed 160,000 entries (kept 160,000) in gpt_pairs_train.jsonl
+  • processed 170,000 entries (kept 170,000) in gpt_pairs_train.jsonl
+  • processed 180,000 entries (kept 180,000) in gpt_pairs_train.jsonl
+  • processed 190,000 entries (kept 190,000) in gpt_pairs_train.jsonl
+  • processed 200,000 entries (kept 200,000) in gpt_pairs_train.jsonl
+  • processed 210,000 entries (kept 210,000) in gpt_pairs_train.jsonl
+  • processed 220,000 entries (kept 220,000) in gpt_pairs_train.jsonl
+  • processed 230,000 entries (kept 230,000) in gpt_pairs_train.jsonl
+  • processed 240,000 entries (kept 240,000) in gpt_pairs_train.jsonl
+  • processed 250,000 entries (kept 250,000) in gpt_pairs_train.jsonl
+  • processed 260,000 entries (kept 260,000) in gpt_pairs_train.jsonl
+  • processed 270,000 entries (kept 270,000) in gpt_pairs_train.jsonl
+  • processed 280,000 entries (kept 280,000) in gpt_pairs_train.jsonl
+  • processed 290,000 entries (kept 290,000) in gpt_pairs_train.jsonl
+  • processed 300,000 entries (kept 300,000) in gpt_pairs_train.jsonl
+  • processed 310,000 entries (kept 310,000) in gpt_pairs_train.jsonl
+  • processed 320,000 entries (kept 320,000) in gpt_pairs_train.jsonl
+  • processed 330,000 entries (kept 330,000) in gpt_pairs_train.jsonl
+  • processed 340,000 entries (kept 340,000) in gpt_pairs_train.jsonl
+  • processed 350,000 entries (kept 350,000) in gpt_pairs_train.jsonl
+  • processed 360,000 entries (kept 360,000) in gpt_pairs_train.jsonl
+  • processed 370,000 entries (kept 370,000) in gpt_pairs_train.jsonl
+  • processed 380,000 entries (kept 380,000) in gpt_pairs_train.jsonl
+  • processed 390,000 entries (kept 390,000) in gpt_pairs_train.jsonl
+  • processed 400,000 entries (kept 400,000) in gpt_pairs_train.jsonl
+  • processed 410,000 entries (kept 410,000) in gpt_pairs_train.jsonl
+  • processed 420,000 entries (kept 420,000) in gpt_pairs_train.jsonl
+  • processed 430,000 entries (kept 430,000) in gpt_pairs_train.jsonl
+  • processed 440,000 entries (kept 440,000) in gpt_pairs_train.jsonl
+  • processed 450,000 entries (kept 450,000) in gpt_pairs_train.jsonl
+  • processed 460,000 entries (kept 460,000) in gpt_pairs_train.jsonl
+  • processed 470,000 entries (kept 470,000) in gpt_pairs_train.jsonl
+  • processed 480,000 entries (kept 480,000) in gpt_pairs_train.jsonl
+  • processed 490,000 entries (kept 490,000) in gpt_pairs_train.jsonl
+  • processed 500,000 entries (kept 500,000) in gpt_pairs_train.jsonl
+  • processed 510,000 entries (kept 510,000) in gpt_pairs_train.jsonl
+  • processed 520,000 entries (kept 520,000) in gpt_pairs_train.jsonl
+  • processed 530,000 entries (kept 530,000) in gpt_pairs_train.jsonl
+  • processed 540,000 entries (kept 540,000) in gpt_pairs_train.jsonl
+  • processed 550,000 entries (kept 550,000) in gpt_pairs_train.jsonl
+  • processed 560,000 entries (kept 560,000) in gpt_pairs_train.jsonl
+  • processed 570,000 entries (kept 570,000) in gpt_pairs_train.jsonl
+  • processed 580,000 entries (kept 580,000) in gpt_pairs_train.jsonl
+  • processed 590,000 entries (kept 590,000) in gpt_pairs_train.jsonl
+  • processed 600,000 entries (kept 600,000) in gpt_pairs_train.jsonl
+  • processed 610,000 entries (kept 610,000) in gpt_pairs_train.jsonl
+  • processed 620,000 entries (kept 620,000) in gpt_pairs_train.jsonl
+  • processed 630,000 entries (kept 630,000) in gpt_pairs_train.jsonl
+  • processed 640,000 entries (kept 640,000) in gpt_pairs_train.jsonl
+  • processed 650,000 entries (kept 650,000) in gpt_pairs_train.jsonl
+  • processed 660,000 entries (kept 660,000) in gpt_pairs_train.jsonl
+  • processed 670,000 entries (kept 670,000) in gpt_pairs_train.jsonl
+  • processed 680,000 entries (kept 680,000) in gpt_pairs_train.jsonl
+  • processed 690,000 entries (kept 690,000) in gpt_pairs_train.jsonl
+  • processed 700,000 entries (kept 700,000) in gpt_pairs_train.jsonl
+  • processed 710,000 entries (kept 710,000) in gpt_pairs_train.jsonl
+  • processed 720,000 entries (kept 720,000) in gpt_pairs_train.jsonl
+  • processed 730,000 entries (kept 730,000) in gpt_pairs_train.jsonl
+  • processed 740,000 entries (kept 740,000) in gpt_pairs_train.jsonl
+  • processed 750,000 entries (kept 750,000) in gpt_pairs_train.jsonl
+  • processed 760,000 entries (kept 760,000) in gpt_pairs_train.jsonl
+  • processed 770,000 entries (kept 770,000) in gpt_pairs_train.jsonl
+  • processed 780,000 entries (kept 780,000) in gpt_pairs_train.jsonl
+  • processed 790,000 entries (kept 790,000) in gpt_pairs_train.jsonl
+  • processed 800,000 entries (kept 800,000) in gpt_pairs_train.jsonl
+  • processed 810,000 entries (kept 810,000) in gpt_pairs_train.jsonl
+  • processed 820,000 entries (kept 820,000) in gpt_pairs_train.jsonl
+  • processed 830,000 entries (kept 830,000) in gpt_pairs_train.jsonl
+  • processed 840,000 entries (kept 840,000) in gpt_pairs_train.jsonl
+  • processed 850,000 entries (kept 850,000) in gpt_pairs_train.jsonl
+  • processed 860,000 entries (kept 860,000) in gpt_pairs_train.jsonl
+  • processed 870,000 entries (kept 870,000) in gpt_pairs_train.jsonl
+  • processed 880,000 entries (kept 880,000) in gpt_pairs_train.jsonl
+  • processed 890,000 entries (kept 890,000) in gpt_pairs_train.jsonl
+  • processed 900,000 entries (kept 900,000) in gpt_pairs_train.jsonl
+  • processed 910,000 entries (kept 910,000) in gpt_pairs_train.jsonl
+  • processed 920,000 entries (kept 920,000) in gpt_pairs_train.jsonl
+  • processed 930,000 entries (kept 930,000) in gpt_pairs_train.jsonl
+  • processed 940,000 entries (kept 940,000) in gpt_pairs_train.jsonl
+  • processed 950,000 entries (kept 950,000) in gpt_pairs_train.jsonl
+  • processed 960,000 entries (kept 960,000) in gpt_pairs_train.jsonl
+  • processed 970,000 entries (kept 970,000) in gpt_pairs_train.jsonl
+  • processed 980,000 entries (kept 980,000) in gpt_pairs_train.jsonl
+  • processed 990,000 entries (kept 990,000) in gpt_pairs_train.jsonl
+  • processed 1,000,000 entries (kept 1,000,000) in gpt_pairs_train.jsonl
+  • processed 1,010,000 entries (kept 1,010,000) in gpt_pairs_train.jsonl
+  • processed 1,020,000 entries (kept 1,020,000) in gpt_pairs_train.jsonl
+  • processed 1,030,000 entries (kept 1,030,000) in gpt_pairs_train.jsonl
+  • processed 1,040,000 entries (kept 1,040,000) in gpt_pairs_train.jsonl
+  • processed 1,050,000 entries (kept 1,050,000) in gpt_pairs_train.jsonl
+  • processed 1,060,000 entries (kept 1,060,000) in gpt_pairs_train.jsonl
+  • processed 1,070,000 entries (kept 1,070,000) in gpt_pairs_train.jsonl
+종료됨

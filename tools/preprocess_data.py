@@ -44,11 +44,17 @@ def load_existing_ids(manifest_path: Path) -> set[str]:
     ids: set[str] = set()
     if manifest_path.exists():
         with open(manifest_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for lineno, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
                 if not line:
                     continue
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    print(
+                        f"[Preprocess] Warning: skipping malformed line {lineno} in {manifest_path}: {exc}"
+                    )
+                    continue
                 ids.add(record["id"])
     return ids
 

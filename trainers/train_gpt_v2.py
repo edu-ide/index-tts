@@ -42,6 +42,15 @@ from omegaconf import OmegaConf
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
+# Aim integration for experiment tracking
+try:
+    import aim
+    from aim.sdk.errors import MissingRunError
+    AIM_AVAILABLE = True
+except ImportError:
+    AIM_AVAILABLE = False
+    print("[Warning] aim not installed. Run: pip install aim")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Finetune IndexTTS2 GPT on Japanese data.")
@@ -87,6 +96,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Enable CUDA AMP.")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from, or 'auto'.")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    # Aim options
+    parser.add_argument("--aim-experiment", type=str, default="indextts-korean", help="Aim experiment name.")
+    parser.add_argument("--aim-run-name", type=str, default=None, help="Aim run name (auto-generated if not specified).")
+    parser.add_argument("--aim-repo", type=str, default=".aim", help="Aim repository path.")
+    parser.add_argument("--no-aim", action="store_true", help="Disable Aim tracking even if available.")
+    # Stage 2 options
+    parser.add_argument("--enable-grl", action="store_true", help="Enable GRL for Stage 2 emotion disentanglement.")
+    parser.add_argument("--speaker-mapping", type=Path, default=None, help="Path to speaker_mapping.json for Stage 2.")
+    parser.add_argument("--grl-lambda", type=float, default=1.0, help="GRL reversal strength (Stage 2).")
+    parser.add_argument("--speaker-loss-weight", type=float, default=0.1, help="Weight for speaker classification loss (Stage 2).")
+    parser.add_argument("--grl-schedule", type=str, default="exponential", choices=["constant", "linear", "exponential"], help="GRL lambda scheduling (Stage 2).")
+    parser.add_argument("--enable-stage2-realtime-emo", action="store_true", help="Compute emo_vec in real-time during Stage 2 for proper gradient flow through emo encoder.")
+    # Stage 3 options
+    parser.add_argument("--freeze-conditioners", action="store_true", help="Freeze feature conditioners (speaker + emotion perceiver) for Stage 3 fine-tuning.")
     return parser.parse_args()
 
 
@@ -137,6 +160,7 @@ class Sample:
     language: Optional[str] = None
     prompt_language: Optional[str] = None
     manifest_path: Optional[Path] = None
+    speaker: Optional[str] = None  # Stage 2: Speaker name for GRL
 
 
 class JapaneseGPTDataset(Dataset):
@@ -226,6 +250,7 @@ class JapaneseGPTDataset(Dataset):
                         language=target_language,
                         prompt_language=prompt_language,
                         manifest_path=manifest_path,
+                        speaker=record.get("speaker"),  # Stage 2: Load speaker name
                     )
                 else:
                     language = self._normalize_language(record.get("language") or spec.language)
@@ -241,6 +266,7 @@ class JapaneseGPTDataset(Dataset):
                         sample_type="single",
                         manifest_path=manifest_path,
                         language=language,
+                        speaker=record.get("speaker"),  # Stage 2: Load speaker name
                     )
 
                 if manifest_sample_type is None:
@@ -344,9 +370,10 @@ class JapaneseGPTDataset(Dataset):
                     "language": sample.language,
                     "prompt_language": sample.prompt_language,
                     "manifest_path": str(sample.manifest_path) if sample.manifest_path else "",
+                    "speaker": sample.speaker,  # Stage 2: Speaker name
                 }
 
-            except (FileNotFoundError, OSError, ValueError) as exc:
+            except (FileNotFoundError, OSError, ValueError, EOFError) as exc:
                 if current_idx not in self.bad_indices:
                     message = (
                         f"[Warn] Skipping sample '{sample.id}' due to load failure: {exc}. "
@@ -387,6 +414,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     languages = [item.get("language") for item in batch]
     prompt_languages = [item.get("prompt_language") for item in batch]
     manifest_paths = [item.get("manifest_path") for item in batch]
+    speakers = [item.get("speaker") for item in batch]  # Stage 2: Speaker names
 
     return {
         "ids": ids,
@@ -402,6 +430,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         "languages": languages,
         "prompt_languages": prompt_languages,
         "manifest_paths": manifest_paths,
+        "speakers": speakers,  # Stage 2: Speaker names
     }
 
 
@@ -417,13 +446,22 @@ def build_model(
     base_checkpoint: Path,
     base_tokenizer_path: Path | None,
     device: torch.device,
+    enable_grl: bool = False,
+    num_speakers: int = 500,
+    grl_lambda: float = 1.0,
 ) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
     if cfg.gpt.number_text_tokens != vocab_size:
         cfg.gpt.number_text_tokens = vocab_size
 
-    model = UnifiedVoice(**cfg.gpt)
+    # Stage 2: Add GRL parameters
+    model = UnifiedVoice(
+        **cfg.gpt,
+        enable_grl=enable_grl,
+        num_speakers=num_speakers,
+        grl_lambda=grl_lambda
+    )
     checkpoint = torch.load(base_checkpoint, map_location="cpu")
     raw_state_dict = checkpoint.get("model", checkpoint)
 
@@ -512,16 +550,43 @@ def compute_losses(
     model: UnifiedVoice,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    speaker_to_id: Optional[Dict[str, int]] = None,
+    speaker_loss_weight: float = 0.1,
+    enable_stage2_realtime_emo: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], Optional[torch.Tensor]]:
     condition = batch["condition"].to(device)
     text_ids = batch["text_ids"].to(device)
     codes = batch["codes"].to(device)
-    emo_vec = batch["emo_vec"].to(device)
+    emo_vec_precomputed = batch["emo_vec"].to(device)
     text_lengths = batch["text_lengths"].to(device)
     code_lengths = batch["code_lengths"].to(device)
+    condition_lengths = batch["condition_lengths"].to(device)
 
     batch_size = text_ids.size(0)
     use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    # Stage 2: Compute emo_vec in real-time from condition (mel-spectrogram)
+    # This allows gradients to flow through emo encoder and enables proper GRL training
+    if enable_stage2_realtime_emo and hasattr(model, 'enable_grl') and model.enable_grl:
+        # condition: [batch, cond_len, 1024] -> transpose to [batch, 1024, cond_len]
+        condition_transposed = condition.transpose(1, 2)
+
+        # Pass through emo conditioning encoder to get emotion features
+        emo_features = model.emo_conditioning_encoder(condition_transposed, condition_lengths)
+
+        # Pass through emo perceiver to get final emo_vec: [batch, 1, output_dim]
+        emo_vec_raw = model.emo_perceiver_encoder(emo_features)
+
+        # Transform: [batch, 1, 1024] -> [batch, 1024] -> [batch, model_dim]
+        emo_vec_syn_ori = emo_vec_raw.squeeze(1)
+        emo_vec_syn = model.emovec_layer(emo_vec_syn_ori)
+        emo_vec = model.emo_layer(emo_vec_syn)
+
+        # Store raw emo_vec for GRL (before final transformation)
+        emo_vec_for_grl = emo_vec
+    else:
+        # Stage 1: Use pre-computed emo_vec
+        emo_vec = emo_vec_precomputed
 
     text_inputs = model.set_text_padding(text_ids.clone(), text_lengths)
     text_inputs = F.pad(text_inputs, (0, 1), value=model.stop_text_token)
@@ -575,7 +640,57 @@ def compute_losses(
             top1 = 0.0
         metrics["mel_top1"] = top1
 
-    return text_loss, mel_loss, metrics
+    # Stage 2: Speaker classification loss
+    speaker_loss = None
+    if speaker_to_id is not None and hasattr(model, 'enable_grl') and model.enable_grl:
+        speakers = batch.get("speakers", [])
+        speaker_labels = []
+        for spk in speakers:
+            if spk and spk in speaker_to_id:
+                speaker_labels.append(speaker_to_id[spk])
+            else:
+                speaker_labels.append(-1)  # Ignore unknown speakers
+
+        speaker_labels_tensor = torch.tensor(speaker_labels, dtype=torch.long, device=device)
+
+        try:
+            with torch.cuda.amp.autocast(enabled=False):  # Disable AMP for speaker classifier
+                # Use emo_vec computed in real-time (if enabled) or transform pre-computed one
+                if enable_stage2_realtime_emo:
+                    # Real-time mode: emo_vec_for_grl already computed above
+                    # Gradients will flow through emo encoder -> proper adversarial training
+                    emo_vec_to_reverse = emo_vec_for_grl
+                else:
+                    # Fallback mode: Transform pre-computed emo_vec
+                    # This is a practical compromise when real-time computation is disabled
+                    emo_vec_to_reverse = model.emo_layer(model.emovec_layer(emo_vec_precomputed))
+
+                # Apply GRL: reverses gradients during backprop
+                emo_vec_reversed = model.grl(emo_vec_to_reverse)
+
+                # Classify speaker from reversed emo_vec
+                speaker_logits = model.speaker_classifier(emo_vec_reversed)
+
+            # Calculate speaker classification loss (ignore -1 labels)
+            valid_mask = speaker_labels_tensor != -1
+            if valid_mask.any():
+                speaker_loss = F.cross_entropy(
+                    speaker_logits[valid_mask],
+                    speaker_labels_tensor[valid_mask],
+                    reduction="mean"
+                )
+                metrics["speaker_loss"] = speaker_loss.item()
+                metrics["speaker_acc"] = (
+                    speaker_logits[valid_mask].argmax(dim=-1) == speaker_labels_tensor[valid_mask]
+                ).float().mean().item()
+            else:
+                speaker_loss = torch.tensor(0.0, device=device)
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to compute speaker loss: {e}")
+            speaker_loss = None
+
+    return text_loss, mel_loss, metrics, speaker_loss
 
 
 def save_checkpoint(
@@ -610,7 +725,10 @@ def evaluate(model: UnifiedVoice, loader: DataLoader, device: torch.device) -> D
     count = 0
     with torch.no_grad():
         for batch in loader:
-            text_loss, mel_loss, metrics = compute_losses(model, batch, device)
+            # Evaluation uses pre-computed emo_vec for speed
+            text_loss, mel_loss, metrics, _ = compute_losses(
+                model, batch, device, enable_stage2_realtime_emo=False
+            )
             bsz = batch["text_ids"].size(0)
             totals["text_loss"] += text_loss.item() * bsz
             totals["mel_loss"] += mel_loss.item() * bsz
@@ -637,10 +755,119 @@ def main() -> None:
         else os.environ["INDEXTTS_RUN_NAME"]
     )
     log_dir = log_root / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_dir))
 
+    # Initialize Aim if available and not disabled
+    use_aim = AIM_AVAILABLE and not args.no_aim
+    aim_run = None
+    if use_aim:
+        aim_run_name = args.aim_run_name or run_name
+        # Create Aim Run
+        try:
+            # Try to resume the run
+            aim_run = aim.Run(
+                repo=args.aim_repo,
+                experiment=args.aim_experiment,
+                run_hash=aim_run_name,
+            )
+        except MissingRunError:
+            # If the run doesn't exist, create a new one
+            aim_run = aim.Run(
+                repo=args.aim_repo,
+                experiment=args.aim_experiment,
+            )
+            # Set the custom run name
+            aim_run.name = aim_run_name
+        # Track hyperparameters
+        aim_run['hparams'] = {
+            'learning_rate': args.learning_rate,
+            'batch_size': args.batch_size,
+            'grad_accumulation': args.grad_accumulation,
+            'epochs': args.epochs,
+            'warmup_steps': args.warmup_steps,
+            'max_steps': args.max_steps,
+            'weight_decay': args.weight_decay,
+            'grad_clip': args.grad_clip,
+            'text_loss_weight': args.text_loss_weight,
+            'mel_loss_weight': args.mel_loss_weight,
+            'amp': args.amp,
+            'seed': args.seed,
+            'tokenizer': str(args.tokenizer),
+            'base_checkpoint': str(args.base_checkpoint),
+            'device': str(device),
+            'output_dir': str(output_dir),
+        }
+        print(f"[Info] Aim initialized: experiment={args.aim_experiment}, run={aim_run_name}")
+        print(f"[Info] View results: aim up --repo {args.aim_repo}")
+    else:
+        if not AIM_AVAILABLE:
+            print("[Info] Aim not available. Install with: pip install aim")
+        else:
+            print("[Info] Aim disabled by --no-aim flag")
+
+    # Stage 2: Load speaker mapping if provided
+    speaker_to_id = None
+    if args.enable_grl and args.speaker_mapping:
+        if not args.speaker_mapping.exists():
+            raise FileNotFoundError(f"Speaker mapping not found: {args.speaker_mapping}")
+        with open(args.speaker_mapping, 'r', encoding='utf-8') as f:
+            speaker_to_id = json.load(f)
+        print(f"[Stage 2] Loaded speaker mapping: {len(speaker_to_id)} speakers")
+
     tokenizer = load_tokenizer(args.tokenizer)
-    model = build_model(args.config, tokenizer, args.base_checkpoint, args.base_tokenizer, device)
+    model = build_model(
+        args.config,
+        tokenizer,
+        args.base_checkpoint,
+        args.base_tokenizer,
+        device,
+        enable_grl=args.enable_grl,
+        num_speakers=len(speaker_to_id) if speaker_to_id else 500,
+        grl_lambda=args.grl_lambda,
+    )
+
+    # Stage 3: Freeze feature conditioners (speaker + emotion perceiver)
+    if args.freeze_conditioners:
+        print("[Stage 3] Freezing feature conditioners...")
+
+        # Freeze speaker conditioning encoder and perceiver
+        if hasattr(model, 'conditioning_encoder'):
+            for param in model.conditioning_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Speaker conditioning encoder frozen")
+
+        if hasattr(model, 'perceiver_encoder'):
+            for param in model.perceiver_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Speaker perceiver encoder frozen")
+
+        # Freeze emotion conditioning encoder and perceiver
+        if hasattr(model, 'emo_conditioning_encoder'):
+            for param in model.emo_conditioning_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Emotion conditioning encoder frozen")
+
+        if hasattr(model, 'emo_perceiver_encoder'):
+            for param in model.emo_perceiver_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Emotion perceiver encoder frozen")
+
+        # Also freeze transformation layers
+        if hasattr(model, 'emovec_layer'):
+            for param in model.emovec_layer.parameters():
+                param.requires_grad = False
+            print("  ✅ Emovec layer frozen")
+
+        if hasattr(model, 'emo_layer'):
+            for param in model.emo_layer.parameters():
+                param.requires_grad = False
+            print("  ✅ Emo layer frozen")
+
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"[Stage 3] Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
@@ -743,8 +970,14 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
             with torch.cuda.amp.autocast(enabled=use_amp):
-                text_loss, mel_loss, metrics = compute_losses(model, batch, device)
+                text_loss, mel_loss, metrics, speaker_loss = compute_losses(
+                    model, batch, device, speaker_to_id, args.speaker_loss_weight,
+                    enable_stage2_realtime_emo=args.enable_stage2_realtime_emo
+                )
                 loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
+                # Stage 2: Add speaker classification loss
+                if speaker_loss is not None:
+                    loss = loss + args.speaker_loss_weight * speaker_loss
             if use_amp:
                 scaler.scale(loss / args.grad_accumulation).backward()
             else:
@@ -770,17 +1003,51 @@ def main() -> None:
                     writer.add_scalar("train/mel_loss", mel_loss.item(), global_step)
                     writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
-                    print(
+
+                    # Stage 2: Log speaker loss metrics
+                    if speaker_loss is not None:
+                        writer.add_scalar("train/speaker_loss", speaker_loss.item(), global_step)
+                        if "speaker_acc" in metrics:
+                            writer.add_scalar("train/speaker_acc", metrics["speaker_acc"], global_step)
+
+                    # Aim logging
+                    if use_aim:
+                        aim_run.track(text_loss.item(), name='text_loss', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(mel_loss.item(), name='mel_loss', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(metrics["mel_top1"], name='mel_top1', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(scheduler.get_last_lr()[0], name='learning_rate', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+
+                        # Stage 2: Track speaker metrics
+                        if speaker_loss is not None:
+                            aim_run.track(speaker_loss.item(), name='speaker_loss', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+                            if "speaker_acc" in metrics:
+                                aim_run.track(metrics["speaker_acc"], name='speaker_acc', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+
+                    # Build log message
+                    log_msg = (
                         f"[Train] epoch={epoch + 1} step={global_step} "
                         f"text_loss={text_loss.item():.4f} mel_loss={mel_loss.item():.4f} "
-                        f"mel_top1={metrics['mel_top1']:.4f} lr={scheduler.get_last_lr()[0]:.2e}"
+                        f"mel_top1={metrics['mel_top1']:.4f}"
                     )
+                    if speaker_loss is not None:
+                        log_msg += f" speaker_loss={speaker_loss.item():.4f}"
+                        if "speaker_acc" in metrics:
+                            log_msg += f" speaker_acc={metrics['speaker_acc']:.4f}"
+                    log_msg += f" lr={scheduler.get_last_lr()[0]:.2e}"
+                    print(log_msg)
 
                 if args.val_interval > 0 and global_step > 0 and global_step % args.val_interval == 0:
                     val_metrics = evaluate(model, val_loader, device)
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
                     writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+
+                    # Aim logging
+                    if use_aim:
+                        aim_run.track(val_metrics["text_loss"], name='text_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(val_metrics["mel_loss"], name='mel_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(val_metrics["mel_top1"], name='mel_top1', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+
                     print(
                         f"[Val] epoch={epoch + 1} step={global_step} "
                         f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
@@ -788,6 +1055,9 @@ def main() -> None:
                     )
                     if val_metrics["mel_loss"] < best_val:
                         best_val = val_metrics["mel_loss"]
+                        # Track best validation loss in Aim
+                        if use_aim:
+                            aim_run.track(best_val, name='best_val_mel_loss', context={'metric': 'best'})
 
                 if global_step % save_every == 0:
                     ckpt_path = output_dir / f"model_step{global_step}.pth"
@@ -816,6 +1086,12 @@ def main() -> None:
                         },
                         output_dir / "latest.pth",
                     )
+
+                    # Log checkpoint save to Aim
+                    if use_aim:
+                        aim_run.track(global_step, name='checkpoint_saved', context={'checkpoint': 'latest'})
+                        print(f"[Info] Checkpoint saved at step {global_step}")
+
                     while len(recent_checkpoints) > 3:
                         obsolete = recent_checkpoints.pop(0)
                         try:
@@ -838,6 +1114,13 @@ def main() -> None:
             writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
             writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
             writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+
+            # Aim logging for end-of-epoch validation
+            if use_aim:
+                aim_run.track(val_metrics["text_loss"], name='text_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                aim_run.track(val_metrics["mel_loss"], name='mel_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                aim_run.track(val_metrics["mel_top1"], name='mel_top1', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+
             print(
                 f"[Val] epoch={epoch + 1} step={global_step} "
                 f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
@@ -845,6 +1128,9 @@ def main() -> None:
             )
             if val_metrics["mel_loss"] < best_val:
                 best_val = val_metrics["mel_loss"]
+                # Track best validation loss in Aim
+                if use_aim:
+                    aim_run.track(best_val, name='best_val_mel_loss', context={'metric': 'best'})
 
 
     if global_step > 0 and last_saved_step != global_step:
@@ -880,6 +1166,12 @@ def main() -> None:
                 os.remove(obsolete)
             except OSError:
                 pass
+
+    # Finalize Aim run
+    if use_aim:
+        aim_run.close()
+        print("[Info] Aim run finalized")
+        print(f"[Info] View results: aim up --repo {args.aim_repo}")
 
     writer.close()
     print("Training complete.")

@@ -307,7 +307,8 @@ class UnifiedVoice(nn.Module):
                  start_text_token=0, stop_text_token=1, number_mel_codes=8194, start_mel_token=8192, stop_mel_token=8193,
                  train_solo_embeddings=False, use_mel_codes_as_input=True,
                  checkpointing=True, types=1,
-                 condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False):
+                 condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False,
+                 enable_grl=False, num_speakers=500, grl_lambda=1.0):
         """
         Args:
             layers: Number of layers in transformer stack.
@@ -380,6 +381,21 @@ class UnifiedVoice(nn.Module):
         self.text_embedding = nn.Embedding(self.number_text_tokens * types + 1, model_dim)
         self.emo_layer = nn.Linear(model_dim, model_dim)
         self.emovec_layer = nn.Linear(1024, model_dim)
+
+        # Stage 2: GRL + Speaker Classifier for emotion-speaker disentanglement
+        self.enable_grl = enable_grl
+        if self.enable_grl:
+            from .gradient_reversal import GradientReversalLayer
+            from .speaker_classifier import SpeakerClassifier
+
+            self.grl = GradientReversalLayer(lambda_=grl_lambda)
+            self.speaker_classifier = SpeakerClassifier(
+                emotion_dim=model_dim,
+                hidden_dim=512,
+                num_speakers=num_speakers,
+                dropout=0.3
+            )
+            print(f"[IndexTTS2 Stage 2] GRL enabled: lambda={grl_lambda}, num_speakers={num_speakers}")
 
         if use_mel_codes_as_input:
             self.mel_embedding = nn.Embedding(self.number_mel_codes, model_dim)
@@ -587,7 +603,7 @@ class UnifiedVoice(nn.Module):
 
 
     def forward(self, speech_conditioning_latent, text_inputs, text_lengths, mel_codes, mel_codes_lengths, emo_speech_conditioning_latent,
-                cond_mel_lengths=None, emo_cond_mel_lengths=None, emo_vec=None, use_speed=None, do_spk_cond=False):
+                cond_mel_lengths=None, emo_cond_mel_lengths=None, emo_vec=None, use_speed=None, do_spk_cond=False, speaker_labels=None):
         """
         Forward pass that uses both text and voice in either text conditioning mode or voice conditioning mode
 
@@ -606,10 +622,23 @@ class UnifiedVoice(nn.Module):
         else:
             speech_conditioning_latent = speech_conditioning_latent
 
+        # Initialize speaker_logits as None (returned for Stage 2 training)
+        speaker_logits = None
+
         if emo_vec is None:
             emo_vec_syn_ori = self.get_emo_conditioning(emo_speech_conditioning_latent.transpose(1,2), emo_cond_mel_lengths)
             emo_vec_syn = self.emovec_layer(emo_vec_syn_ori)
             emo_vec = self.emo_layer(emo_vec_syn)
+
+            # Stage 2: GRL + Speaker Classifier for emotion-speaker disentanglement
+            if self.enable_grl and self.training and speaker_labels is not None:
+                # Apply GRL to emo_vec
+                emo_vec_reversed = self.grl(emo_vec)
+
+                # Predict speaker from reversed emo_vec
+                speaker_logits = self.speaker_classifier(emo_vec_reversed)
+                # Note: Loss will be computed outside this function
+                # total_loss = tts_loss + speaker_classification_loss(speaker_logits, speaker_labels)
 
         text_inputs = self.set_text_padding(text_inputs, text_lengths)
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
@@ -628,7 +657,12 @@ class UnifiedVoice(nn.Module):
         mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
 
         text_logits, mel_logits = self.get_logits(conds, text_emb, self.text_head, mel_emb, self.mel_head, get_attns=False, return_latent=True)
-        return mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+
+        # Return mel_logits and speaker_logits (for Stage 2 GRL training)
+        if speaker_logits is not None:
+            return mel_logits[:, :-2], speaker_logits
+        else:
+            return mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
 
     def prepare_gpt_inputs(
         self,

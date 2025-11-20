@@ -25,6 +25,38 @@ FORCE="${FORCE:-0}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
+usage() {
+  cat <<'USAGE'
+Usage: ko_step3_generate_pairs.sh [--force]
+
+Environment variables can also be used to tweak behavior:
+  DATASET_DIR, TRAIN_OUTPUT_NAME, VAL_OUTPUT_NAME, PAIRS_PER_TARGET,
+  MIN_TEXT_LEN, MIN_CODE_LEN, MAX_PAIRS, SEED, FORCE, TIMEOUT_SECS, PYTHON_BIN
+
+Flags:
+  --force     Overwrite existing output files (equivalent to FORCE=1)
+  -h, --help  Show this message
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force)
+      FORCE=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 CMD=(
   "${PYTHON_BIN}"
   "${SCRIPT_DIR}/generate_gpt_pairs.py"
