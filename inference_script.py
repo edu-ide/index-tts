@@ -82,6 +82,18 @@ def parse_args() -> argparse.Namespace:
         help="Use fp16 inference when running on CUDA.",
     )
     parser.add_argument(
+        "--target-codes",
+        type=int,
+        default=None,
+        help="Force semantic token count T (duration control). Truncate/pad codes to this length.",
+    )
+    parser.add_argument(
+        "--target-frames",
+        type=int,
+        default=None,
+        help="Force output mel frame length (overrides heuristic 1.72× semantic length).",
+    )
+    parser.add_argument(
         "--gpt-checkpoint",
         type=str,
         default=None,
@@ -243,6 +255,8 @@ def main() -> None:
             interval_silence=args.interval_silence,
             verbose=args.verbose,
             max_text_tokens_per_segment=args.max_text_tokens,
+            target_codes=args.target_codes,
+            target_frames=args.target_frames,
             **generation_kwargs,
         )
         print(f"Inference complete. Output saved to {Path(args.output).resolve()}")
