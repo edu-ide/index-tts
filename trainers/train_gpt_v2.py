@@ -65,19 +65,8 @@ try:
 except ImportError:
     from indextts.utils.scheduler import get_wsd_schedule_with_warmup as get_wsd_schedule
 
-# Liger Kernel Integration (Memory & Speed Optimization)
-try:
-    import liger_kernel
-    try:
-        from liger_kernel.transformers import apply_liger_kernel_to_gpt2
-        LIGER_AVAILABLE = True
-    except Exception as e:
-        LIGER_AVAILABLE = False
-        print("[Warning] liger-kernel found but transformers.apply_liger_kernel_to_gpt2 is missing. "
-              "Update liger-kernel or skip; continuing without Liger.")
-except ImportError:
-    LIGER_AVAILABLE = False
-    print("[Warning] Liger Kernel not found. Install with `pip install liger-kernel` for memory savings.")
+# Liger Kernel Integration: disabled (no GPT2 patch currently available)
+LIGER_AVAILABLE = False
 
 # Aim integration for experiment tracking
 try:
