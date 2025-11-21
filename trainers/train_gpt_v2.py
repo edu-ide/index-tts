@@ -133,7 +133,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", type=str, default="wsd", choices=["cosine", "wsd", "none"], help="Scheduler choice: cosine, wsd (Warmup-Stable-Decay), or none.")
     parser.add_argument("--wsd-stable-ratio", type=float, default=0.9, help="Ratio of stable phase for WSD scheduler (default: 0.9).")
     parser.add_argument("--wsd-min-lr-ratio", type=float, default=0.0, help="Minimum LR ratio for WSD scheduler (default: 0.0).")
-    parser.add_argument("--load-ckpt-to-device", action="store_true", help="Load checkpoint directly to device instead of CPU (faster startup, higher peak memory).")
+    parser.add_argument(
+        "--cpu-ckpt-load",
+        action="store_true",
+        help="Force loading checkpoint to CPU instead of device (default: load to device for faster startup).",
+    )
     parser.add_argument(
         "--duration-conditioning",
         type=str,
@@ -494,7 +498,7 @@ def build_model(
     enable_grl: bool = False,
     num_speakers: int = 500,
     grl_lambda: float = 1.0,
-    load_ckpt_to_device: bool = False,
+    load_ckpt_to_device: bool = True,
 ) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
@@ -960,7 +964,7 @@ def main() -> None:
         enable_grl=args.enable_grl,
         num_speakers=len(speaker_to_id) if speaker_to_id else 500,
         grl_lambda=args.grl_lambda,
-        load_ckpt_to_device=args.load_ckpt_to_device,
+        load_ckpt_to_device=not args.cpu_ckpt_load,
     )
 
     # Apply Liger Kernel Optimization (Before compilation)
@@ -1178,8 +1182,7 @@ def main() -> None:
         else:
             resume_path = args.resume
     if resume_path:
-        # Load checkpoint to CPU first to avoid GPU OOM
-        map_loc = device if args.load_ckpt_to_device else "cpu"
+        map_loc = device if not args.cpu_ckpt_load else "cpu"
         print(f"[Info] Loading checkpoint from {resume_path} to {map_loc} ...")
         checkpoint = torch.load(resume_path, map_location=map_loc)
 
