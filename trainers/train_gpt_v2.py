@@ -1174,13 +1174,15 @@ def main() -> None:
     last_saved_step: int | None = None
 
     resume_path: str | None = None
-    if args.resume:
-        if args.resume == "auto":
-            candidate = output_dir / "latest.pth"
-            if candidate.exists():
-                resume_path = str(candidate)
-        else:
-            resume_path = args.resume
+    resume_raw = (args.resume or "").strip()
+    if resume_raw in ('', '""', "''"):
+        resume_path = None
+    elif resume_raw == "auto":
+        candidate = output_dir / "latest.pth"
+        if candidate.exists():
+            resume_path = str(candidate)
+    else:
+        resume_path = resume_raw
     if resume_path:
         map_loc = device if not args.cpu_ckpt_load else "cpu"
         print(f"[Info] Loading checkpoint from {resume_path} to {map_loc} ...")
