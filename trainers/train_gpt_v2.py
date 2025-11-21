@@ -139,7 +139,8 @@ def parse_args() -> argparse.Namespace:
         help="Force loading checkpoint to CPU instead of device (default: load to device for faster startup).",
     )
     # Clip-aware LR control
-    parser.add_argument("--clipaware-enable", action="store_true", help="Enable simple clip-rate-aware LR decay.")
+    parser.add_argument("--clipaware-enable", dest="clipaware_enable", action="store_true", default=True, help="Enable clip-rate-aware LR decay (default: on).")
+    parser.add_argument("--clipaware-disable", dest="clipaware_enable", action="store_false", help="Disable clip-rate-aware LR decay.")
     parser.add_argument("--clipaware-window", type=int, default=1000, help="Sliding window size for clip rate.")
     parser.add_argument("--clipaware-threshold", type=float, default=0.5, help="If clip rate >= threshold, decay LR.")
     parser.add_argument("--clipaware-decay", type=float, default=0.5, help="LR decay factor when triggered.")
