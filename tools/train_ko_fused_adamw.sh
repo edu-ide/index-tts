@@ -12,6 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 기본값: IndexTTS-2 gpt.pth (완전 새 시작). 재개하려면 CKPT=/path/to/latest.pth 로 override.
 CKPT="${CKPT:-/mnt/sda1/models/IndexTTS-2/gpt.pth}"
 
+# If FRESH_OPT=1, load only model weights from CKPT and start optimizer/scheduler fresh (useful when changing LR/batch).
+FRESH_OPT="${FRESH_OPT:-0}"
+
 OPTIMIZER="${OPTIMIZER:-adamw}"
 SCHEDULER="${SCHEDULER:-wsd}"           # 논문 기반 WSD 추천
 LR="${LR:-3e-5}"                        # 8x1 배치에 맞춘 보수적 LR
@@ -50,6 +53,8 @@ CMD_ENV=(
   WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO}"
   BASE_CHECKPOINT="${CKPT}"
   AMP="${AMP}"
+  # If FRESH_OPT=1, don't resume optimizer/scheduler (model-only load)
+  RESUME="$( [[ \"${FRESH_OPT}\" == \"1\" ]] && echo \"\" || echo \"${RESUME:-}\" )"
   DURATION_CONDITIONING="${DURATION_CONDITIONING}"
 )
 

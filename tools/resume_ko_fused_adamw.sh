@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Resume training with fused AdamW from an existing checkpoint (keeps optimizer/scheduler state).
+# Resume training with fused AdamW from an existing checkpoint.
+# If FRESH_OPT=1, load only model weights and reset optimizer/scheduler (useful when changing LR/batch).
 set -euo pipefail
 
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
@@ -10,6 +11,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CKPT="${CKPT:-/mnt/sda1/models/index-tts-ko/checkpoints/latest.pth}"
+FRESH_OPT="${FRESH_OPT:-0}"
 
 OPTIMIZER="${OPTIMIZER:-adamw}"
 SCHEDULER="${SCHEDULER:-wsd}"
@@ -28,7 +30,12 @@ WSD_STABLE_RATIO="${WSD_STABLE_RATIO:-0.9}"
 WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO:-0.05}"
 DURATION_CONDITIONING="${DURATION_CONDITIONING:-length}"
 
-echo "Resuming from checkpoint (with optimizer state): ${CKPT}"
+echo "Resuming from checkpoint: ${CKPT}"
+if [[ "${FRESH_OPT}" == "1" ]]; then
+  echo "  -> FRESH_OPT=1: optimizer/scheduler will NOT be resumed (model weights only)."
+else
+  echo "  -> FRESH_OPT=0: optimizer/scheduler will be resumed."
+fi
 
 CMD_ENV=(
   OPTIMIZER="${OPTIMIZER}"
@@ -46,7 +53,7 @@ CMD_ENV=(
   WSD_STABLE_RATIO="${WSD_STABLE_RATIO}"
   WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO}"
   BASE_CHECKPOINT="${CKPT}"
-  RESUME="${CKPT}"
+  RESUME="$( [[ \"${FRESH_OPT}\" == \"1\" ]] && echo \"\" || echo \"${CKPT}\" )"
   AMP="${AMP}"
   DURATION_CONDITIONING="${DURATION_CONDITIONING}"
 )
