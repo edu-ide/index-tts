@@ -133,6 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", type=str, default="wsd", choices=["cosine", "wsd", "none"], help="Scheduler choice: cosine, wsd (Warmup-Stable-Decay), or none.")
     parser.add_argument("--wsd-stable-ratio", type=float, default=0.9, help="Ratio of stable phase for WSD scheduler (default: 0.9).")
     parser.add_argument("--wsd-min-lr-ratio", type=float, default=0.0, help="Minimum LR ratio for WSD scheduler (default: 0.0).")
+    parser.add_argument("--load-ckpt-to-device", action="store_true", help="Load checkpoint directly to device instead of CPU (faster startup, higher peak memory).")
     parser.add_argument(
         "--duration-conditioning",
         type=str,
@@ -493,6 +494,7 @@ def build_model(
     enable_grl: bool = False,
     num_speakers: int = 500,
     grl_lambda: float = 1.0,
+    load_ckpt_to_device: bool = False,
 ) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
@@ -506,7 +508,8 @@ def build_model(
         num_speakers=num_speakers,
         grl_lambda=grl_lambda
     )
-    checkpoint = torch.load(base_checkpoint, map_location="cpu")
+    map_loc = device if load_ckpt_to_device else "cpu"
+    checkpoint = torch.load(base_checkpoint, map_location=map_loc)
     raw_state_dict = checkpoint.get("model", checkpoint)
 
     filtered_state_dict = {}
@@ -957,6 +960,7 @@ def main() -> None:
         enable_grl=args.enable_grl,
         num_speakers=len(speaker_to_id) if speaker_to_id else 500,
         grl_lambda=args.grl_lambda,
+        load_ckpt_to_device=args.load_ckpt_to_device,
     )
 
     # Apply Liger Kernel Optimization (Before compilation)
@@ -1175,8 +1179,9 @@ def main() -> None:
             resume_path = args.resume
     if resume_path:
         # Load checkpoint to CPU first to avoid GPU OOM
-        print(f"[Info] Loading checkpoint from {resume_path} to CPU...")
-        checkpoint = torch.load(resume_path, map_location="cpu")
+        map_loc = device if args.load_ckpt_to_device else "cpu"
+        print(f"[Info] Loading checkpoint from {resume_path} to {map_loc} ...")
+        checkpoint = torch.load(resume_path, map_location=map_loc)
 
         # Strip _orig_mod. prefix from torch.compile checkpoints
         state_dict = checkpoint["model"]
