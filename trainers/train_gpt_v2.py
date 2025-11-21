@@ -138,6 +138,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force loading checkpoint to CPU instead of device (default: load to device for faster startup).",
     )
+    # Clip-aware LR control
+    parser.add_argument("--clipaware-enable", action="store_true", help="Enable simple clip-rate-aware LR decay.")
+    parser.add_argument("--clipaware-window", type=int, default=1000, help="Sliding window size for clip rate.")
+    parser.add_argument("--clipaware-threshold", type=float, default=0.5, help="If clip rate >= threshold, decay LR.")
+    parser.add_argument("--clipaware-decay", type=float, default=0.5, help="LR decay factor when triggered.")
+    parser.add_argument("--clipaware-min-lr", type=float, default=1e-6, help="Minimum LR clamp for clip-aware decay.")
+    parser.add_argument("--clipaware-cooldown", type=int, default=500, help="Steps to wait after a decay before next check.")
     parser.add_argument(
         "--duration-conditioning",
         type=str,
@@ -804,6 +811,55 @@ def get_effective_lr(optimizer: torch.optim.Optimizer, reported_lr: float) -> fl
     return reported_lr
 
 
+class ClipAwareLRController:
+    """
+    Simple clip-rate-aware LR decay controller.
+    - Tracks how often grad clipping is applied over a sliding window.
+    - If clip rate >= threshold and cooldown passed, decays LR by factor (bounded by min_lr).
+    - Designed to be called once per optimizer step.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        window: int = 1000,
+        threshold: float = 0.5,
+        decay: float = 0.5,
+        min_lr: float = 1e-6,
+        cooldown: int = 500,
+    ):
+        self.optimizer = optimizer
+        self.window = max(1, window)
+        self.threshold = threshold
+        self.decay = decay
+        self.min_lr = min_lr
+        self.cooldown = cooldown
+        self.clip_bools = []
+        self.last_decay_step = -cooldown  # allow decay early
+        self.step_idx = 0
+
+    def record(self, clipped: bool):
+        self.clip_bools.append(bool(clipped))
+        if len(self.clip_bools) > self.window:
+            self.clip_bools.pop(0)
+        self.step_idx += 1
+
+    def maybe_decay(self):
+        if len(self.clip_bools) < self.window:
+            return
+        if self.step_idx - self.last_decay_step < self.cooldown:
+            return
+        clip_rate = sum(self.clip_bools) / float(len(self.clip_bools))
+        if clip_rate < self.threshold:
+            return
+        for group in self.optimizer.param_groups:
+            old_lr = group.get("lr", 0.0)
+            new_lr = max(self.min_lr, old_lr * self.decay)
+            group["lr"] = new_lr
+        self.last_decay_step = self.step_idx
+        return True
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -1228,6 +1284,18 @@ def main() -> None:
     last_log_step = global_step
     last_log_time = time.time()
 
+    # Clip-aware LR controller
+    clip_controller = None
+    if args.clipaware_enable:
+        clip_controller = ClipAwareLRController(
+            optimizer,
+            window=args.clipaware_window,
+            threshold=args.clipaware_threshold,
+            decay=args.clipaware_decay,
+            min_lr=args.clipaware_min_lr,
+            cooldown=args.clipaware_cooldown,
+        )
+
     # Data loading time tracking
     data_load_time = 0.0
     compute_time = 0.0
@@ -1278,7 +1346,12 @@ def main() -> None:
                         scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     clipped_grad_norm = min(total_norm, args.grad_clip)
-                
+                    if clip_controller:
+                        clip_controller.record(clipped=True)
+                else:
+                    if clip_controller:
+                        clip_controller.record(clipped=False)
+
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
@@ -1286,6 +1359,13 @@ def main() -> None:
                     optimizer.step()
                 if scheduler:
                     scheduler.step()
+
+                # Clip-aware LR decay (after step)
+                if clip_controller:
+                    decayed = clip_controller.maybe_decay()
+                    if decayed:
+                        print(f"[ClipAware] High clip rate detected; decayed LR by {args.clipaware_decay} (min={args.clipaware_min_lr})")
+
                 optimizer.zero_grad(set_to_none=True)
                 
                 # MARS: Update last gradient for variance reduction
