@@ -38,7 +38,8 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
+            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False,
+            gpt_ckpt_override: str | None = None
     ):
         """
         Args:
@@ -83,7 +84,9 @@ class IndexTTS2:
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        self.gpt_path = gpt_ckpt_override if gpt_ckpt_override else os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        if gpt_ckpt_override and not os.path.exists(self.gpt_path):
+            raise FileNotFoundError(f"Specified gpt checkpoint not found: {self.gpt_path}")
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:

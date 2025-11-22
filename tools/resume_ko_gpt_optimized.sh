@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# 최적화된 한국어 GPT 재개 스크립트
+# 최적화된 한국어 GPT 재개 스크립트 (Phase 1/Phase 2 전략)
 #
-# 최적화 설정 (논문 기반):
-# - LR: 1e-5 (BERT/GPT fine-tuning 권장 범위 1e-5~5e-5 내)
-# - Batch: 8 (RTX 4090 24GB 검증된 안전값)
-# - Grad Accumulation: 8 (실효 batch 64 = ~34,694 tokens)
-# - Warmup: 30,000 steps (현재 학습 유지, 다음은 5,000 권장)
-# - Grad Clip: 0.5 (gradient explosion 방지)
+# 2단계 학습 전략:
+# Phase 1 (0→240k): GRAD_ACC=1, LR=2e-5 (빠른 수렴)
+# Phase 2 (240k→끝): GRAD_ACC=8, LR=5e-6 (안정화)
 #
-# 참고문헌:
-# [1] Attention is All You Need (Vaswani+ 2017) - ~25k tokens/batch
-# [2] BERT (Devlin+ 2019) - fine-tuning LR
-# [3] Decoupled Weight Decay (Loshchilov+ 2019) - AdamW
+# 이 스크립트는 checkpoint step에 따라 자동으로 Phase 선택:
+# - Step < 240k: Phase 1 설정 사용
+# - Step >= 240k: Phase 2 설정 사용
 #
-# Batch 8 × Grad Acc 8 = 64 효과:
-# - Total tokens/batch: ~34,694 (Transformer 논문 수준 ✅)
-# - RTX 4090 24GB 메모리 안전성 보장 ✅
-# - mel_loss variance 대폭 감소 예상 (~70%)
-# - Training loss 안정화
-# - 학습 속도 약간 감소 (허용 범위)
+# Phase 1: 빠른 수렴
+# - LR: 2e-5 (공격적)
+# - GRAD_ACC: 1 (빠른 학습)
+# - MAX_STEPS: 240000
+#
+# Phase 2: 안정화
+# - LR: 5e-6 (안정적)
+# - GRAD_ACC: 8 (batch 크기 증가)
+# - EPOCHS: 3
 
 set -euo pipefail
 
@@ -39,12 +38,6 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-/mnt/sda1/models/index-tts-ko/checkpoints}"
 RESUME_PATH="${RESUME_PATH:-${CHECKPOINT_DIR}/latest.pth}"
 DATASET_DIR="${DATASET_DIR:-/mnt/sda1/emilia-yodas/KO_preprocessed}"
 RAW_MANIFEST="${RAW_MANIFEST:-/mnt/sda1/emilia-yodas/KO/ko_manifest_raw.jsonl}"
-
-# Worker profile: default=auto, low=NUM_WORKERS=0, med=NUM_WORKERS=2
-WORKER_PROFILE="${1:-auto}"
-if [[ $# -gt 0 ]]; then
-  shift
-fi
 
 SKIP_DATA_CHECK="${SKIP_DATA_CHECK:-1}"
 
@@ -80,52 +73,65 @@ else
   echo "⏭️  데이터 검사 생략 (SKIP_DATA_CHECK=1)" >&2
 fi
 
-# Worker profile 설정
-case "${WORKER_PROFILE}" in
-  low)
-    export NUM_WORKERS=0
-    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
-    export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-2}"
-    echo "⚙️  Worker profile: low (NUM_WORKERS=0, threads=2)" >&2
-    ;;
-  med)
-    export NUM_WORKERS=2
-    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
-    export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-4}"
-    echo "⚙️  Worker profile: med (NUM_WORKERS=2, threads=4)" >&2
-    ;;
-  auto|*)
-    echo "⚙️  Worker profile: auto (환경변수 유지)" >&2
-    ;;
-esac
-
-echo ""
-echo "📊 최적화 설정 (Transformer 논문 기반):"
-echo "  - Batch Size: 8 (RTX 4090 검증됨)"
-echo "  - Gradient Accumulation: 8 (실효 batch 64)"
-echo "  - Tokens/Batch: ~34,694 (Transformer 논문 수준)"
-echo "  - Learning Rate: 1e-5"
-echo "  - Warmup Steps: 30,000"
-echo "  - Gradient Clip: 0.5"
-echo "  - Epochs: 2"
-echo ""
-echo "🎯 기대 효과:"
-echo "  - mel_loss variance 대폭 감소 (~70%)"
-echo "  - Training loss 안정화"
-echo "  - Validation loss 지속 감소"
-echo "  - Transformer 논문 기준 달성 ✅"
-echo "  - RTX 4090 24GB 메모리 안전 ✅"
-echo ""
-
-# 사용자 확인
-read -p "학습을 재개하시겠습니까? (y/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-  echo "취소되었습니다."
-  exit 0
+# NUM_WORKERS 자동 설정 (최대 성능 - CPU 코어 수 사용)
+if [[ -z "${NUM_WORKERS:-}" ]]; then
+  CPU_CORES=$(nproc)
+  export NUM_WORKERS=${CPU_CORES}
+  echo "⚙️  NUM_WORKERS 자동 설정: ${NUM_WORKERS} (CPU 코어 수)" >&2
+else
+  echo "⚙️  NUM_WORKERS 사용자 설정: ${NUM_WORKERS}" >&2
 fi
+
+# 체크포인트에서 step 추출
+CKPT_STEP=0
+if [[ "${RESUME_PATH}" =~ model_step([0-9]+)\.pth ]]; then
+  CKPT_STEP="${BASH_MATCH[1]}"
+elif python3 -c "import torch; print(torch.load('${RESUME_PATH}', map_location='cpu').get('step', 0))" 2>/dev/null | grep -q '^[0-9]\+$'; then
+  CKPT_STEP=$(python3 -c "import torch; print(torch.load('${RESUME_PATH}', map_location='cpu').get('step', 0))")
+fi
+
+echo "📊 체크포인트 Step: ${CKPT_STEP}"
+echo ""
+
+# Phase 자동 선택
+PHASE_THRESHOLD=240000
+if [[ ${CKPT_STEP} -lt ${PHASE_THRESHOLD} ]]; then
+  PHASE="Phase 1"
+  LR_VAL=2e-5
+  GRAD_ACC_VAL=1
+  GRAD_CLIP_VAL=1.0
+  WARMUP_VAL=1000
+  MAX_STEPS_VAL=240000
+  EPOCHS_VAL=999
+  echo "🚀 Phase 1: 빠른 수렴 (Step 0 → 240k)"
+  echo "  - LR: ${LR_VAL} (공격적)"
+  echo "  - GRAD_ACC: ${GRAD_ACC_VAL} (빠른 학습)"
+  echo "  - GRAD_CLIP: ${GRAD_CLIP_VAL} (LR에 맞춘 안전장치)"
+  echo "  - Warmup: ${WARMUP_VAL}"
+  echo "  - Max Steps: ${MAX_STEPS_VAL}"
+else
+  PHASE="Phase 2"
+  LR_VAL=5e-6
+  GRAD_ACC_VAL=8
+  GRAD_CLIP_VAL=0.5
+  WARMUP_VAL=1000
+  MAX_STEPS_VAL=0
+  EPOCHS_VAL=3
+  echo "🎯 Phase 2: 안정화 (Step 240k → 끝)"
+  echo "  - LR: ${LR_VAL} (안정적)"
+  echo "  - GRAD_ACC: ${GRAD_ACC_VAL} (batch 크기 증가)"
+  echo "  - GRAD_CLIP: ${GRAD_CLIP_VAL} (보수적 안전장치)"
+  echo "  - Warmup: ${WARMUP_VAL}"
+  echo "  - Epochs: ${EPOCHS_VAL}"
+fi
+
+echo ""
+echo "⚙️  공통 설정:"
+echo "  - Batch Size: 8 (RTX 4090 검증됨)"
+echo ""
+
+# 사용자 확인 스킵 (자동 실행)
+echo "자동으로 ${PHASE} 학습을 재개합니다..."
 
 echo ""
 echo "🎬 학습을 재개합니다..."
@@ -133,16 +139,17 @@ echo "📊 TensorBoard: http://localhost:6006"
 echo "📁 체크포인트: ${CHECKPOINT_DIR}/"
 echo ""
 
-# 최적화된 설정으로 재개 (Transformer 논문 기반, RTX 4090 안전)
+# Phase별 최적화 설정으로 재개
 SKIP_DATA_CHECK=1 \
-LR=1e-5 \
-WARMUP_STEPS=30000 \
+LR=${LR_VAL} \
+WARMUP_STEPS=${WARMUP_VAL} \
 BATCH_SIZE=8 \
-GRAD_ACC=8 \
-GRAD_CLIP=0.5 \
+GRAD_ACC=${GRAD_ACC_VAL} \
+GRAD_CLIP=${GRAD_CLIP_VAL} \
 LOG_INTERVAL=100 \
-VAL_INTERVAL=1000 \
-EPOCHS=2 \
+VAL_INTERVAL=10000 \
+MAX_STEPS=${MAX_STEPS_VAL} \
+EPOCHS=${EPOCHS_VAL} \
 BASE_CHECKPOINT="/mnt/sda1/models/IndexTTS-2/gpt.pth" \
 RESUME="${RESUME_PATH}" \
 "${SCRIPT_DIR}/ko_step4_train_gpt.sh" "$@"
@@ -157,12 +164,11 @@ echo "  - 최고 성능: ${CHECKPOINT_DIR}/best_model.pth"
 echo "  - 최신: ${CHECKPOINT_DIR}/latest.pth"
 echo ""
 if [[ -f "${CHECKPOINT_DIR}/best_loss.txt" ]]; then
-  echo "🏆 Best mel_loss: $(cat "${CHECKPOINT_DIR}/best_loss.txt")"
+  echo "🎯 Best text_loss: $(cat "${CHECKPOINT_DIR}/best_loss.txt")"
 fi
 echo ""
 echo "다음 단계:"
 echo "  1. TensorBoard로 학습 곡선 확인"
-echo "  2. mel_loss variance 감소 확인 (이전 대비 ~70% 개선 예상)"
-echo "  3. Step 30k warmup 완료 후 안정화 평가"
-echo "  4. 다음 학습 시 warmup 5000으로 단축 고려"
+echo "  2. ${PHASE} 완료 후 다음 Phase 진행 (해당시)"
+echo "  3. best_model.pth로 음성 생성 테스트"
 echo ""

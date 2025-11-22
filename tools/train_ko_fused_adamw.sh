@@ -27,6 +27,10 @@ LOG_INTERVAL="${LOG_INTERVAL:-100}"
 VAL_INTERVAL="${VAL_INTERVAL:-10000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"    # 배치 축소 시 1k 워밍업
+# Allow alias WSD_WARMUP for convenience
+if [[ -n "${WSD_WARMUP:-}" ]]; then
+  WARMUP_STEPS="${WSD_WARMUP}"
+fi
 MAX_STEPS="${MAX_STEPS:-0}"             # 0이면 epoch 기반에서 자동 계산
 WSD_STABLE_RATIO="${WSD_STABLE_RATIO:-0.9}"
 WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO:-0.05}"

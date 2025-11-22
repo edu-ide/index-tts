@@ -48,91 +48,126 @@ cp -r /mnt/sda1/models/index-tts-ko/checkpoints/* "${BACKUP_DIR}/" || true
 echo "백업 완료: ${BACKUP_DIR}"
 echo ""
 
-# Best checkpoint 모니터링 스크립트 생성
+# Best checkpoint 모니터링 스크립트 생성 (체크포인트의 loss를 직접 비교)
 cat > /tmp/monitor_best_checkpoint.py << 'EOF'
 #!/usr/bin/env python3
 """
-Best checkpoint 모니터링 및 자동 저장
-TensorBoard 로그를 실시간으로 체크하여 최고 성능 체크포인트를 별도 저장
+Best checkpoint 모니터링 및 자동 저장 (체크포인트에 저장된 loss 기준)
+- latest.pth를 읽어 loss 비교 후 best_model_stepXXXX.pth 갱신
 """
 import time
 import shutil
 from pathlib import Path
-from tensorboard.backend.event_processing import event_accumulator
 
-log_dir = Path("/mnt/sda1/models/index-tts-ko/checkpoints/logs")
+import torch
+
 ckpt_dir = Path("/mnt/sda1/models/index-tts-ko/checkpoints")
-best_ckpt_path = ckpt_dir / "best_model.pth"
+latest_ckpt = ckpt_dir / "latest.pth"
 best_loss_file = ckpt_dir / "best_loss.txt"
+best_step_file = ckpt_dir / "best_step.txt"
 
-# 초기 best loss
 if best_loss_file.exists():
-    with open(best_loss_file, 'r') as f:
-        best_loss = float(f.read().strip())
+    try:
+        with open(best_loss_file, 'r') as f:
+            best_loss = float(f.read().strip())
+    except Exception:
+        best_loss = float('inf')
 else:
     best_loss = float('inf')
 
-print(f"Best checkpoint monitor started (current best: {best_loss:.4f})")
+print("Best checkpoint monitor started (checkpoint loss criterion)")
+print(f"  Current best loss: {best_loss if best_loss < float('inf') else 'inf'}")
 
-def get_latest_run():
-    runs = sorted(log_dir.glob("run_*"))
-    return runs[-1] if runs else None
 
-last_checked_step = -1
+def extract_loss(ckpt: dict):
+    # validation 우선, 없으면 None 반환
+    extra = ckpt.get("extra") or {}
+    candidates = [
+        ("val_text_loss", ckpt.get("val_text_loss")),
+        ("val_mel_loss", ckpt.get("val_mel_loss")),
+        ("val_text_loss", extra.get("val_text_loss")),
+        ("val_mel_loss", extra.get("val_mel_loss")),
+    ]
+    for name, value in candidates:
+        if value is not None:
+            try:
+                return name, float(value)
+            except Exception:
+                continue
+    return None, None
+
+
+last_mtime = 0.0
 
 while True:
     try:
-        latest_run = get_latest_run()
-        if not latest_run:
+        if not latest_ckpt.exists():
             time.sleep(30)
             continue
 
-        ea = event_accumulator.EventAccumulator(str(latest_run))
-        ea.Reload()
-
-        # Validation loss 확인 (없으면 train loss 사용)
-        loss_tag = 'val/mel_loss' if 'val/mel_loss' in ea.Tags()['scalars'] else 'train/mel_loss'
-
-        if loss_tag not in ea.Tags()['scalars']:
+        mtime = latest_ckpt.stat().st_mtime
+        if mtime == last_mtime:
             time.sleep(30)
             continue
 
-        events = ea.Scalars(loss_tag)
-        if not events:
+        last_mtime = mtime
+
+        try:
+            ckpt = torch.load(latest_ckpt, map_location="cpu")
+        except Exception as load_err:
+            print(f"Error loading {latest_ckpt.name}: {load_err}")
             time.sleep(30)
             continue
 
-        latest_event = events[-1]
-
-        if latest_event.step == last_checked_step:
+        metric_name, current_loss = extract_loss(ckpt)
+        if metric_name is None:
+            print("Warning: no validation loss found in checkpoint; waiting for next validation")
             time.sleep(30)
             continue
 
-        last_checked_step = latest_event.step
-        current_loss = latest_event.value
+        step = ckpt.get("step") or ckpt.get("global_step") or ckpt.get("epoch")
+        if step is None:
+            step = 0
 
-        # Best 업데이트 확인
         if current_loss < best_loss:
             best_loss = current_loss
 
-            # 해당 step의 체크포인트 찾기
-            step_ckpt = ckpt_dir / f"model_step{latest_event.step}.pth"
+            # 복사 대상: latest.pth (rounding 필요 없으므로 그대로 사용)
+            target_ckpt = latest_ckpt
+            target_step = step
 
-            # 1000 step 단위로 저장되므로, 가장 가까운 step 찾기
-            rounded_step = (latest_event.step // 1000) * 1000
-            step_ckpt = ckpt_dir / f"model_step{rounded_step}.pth"
+            for old_best in ckpt_dir.glob("best_model_step*.pth"):
+                try:
+                    old_best.unlink()
+                except Exception:
+                    pass
+            legacy = ckpt_dir / "best_model.pth"
+            if legacy.exists():
+                try:
+                    legacy.unlink()
+                except Exception:
+                    pass
 
-            if step_ckpt.exists():
-                # Best checkpoint 복사
-                shutil.copy2(step_ckpt, best_ckpt_path)
+            best_target = ckpt_dir / f"best_model_step{target_step}.pth"
 
-                # Best loss 저장
-                with open(best_loss_file, 'w') as f:
-                    f.write(f"{best_loss:.6f}")
+            def _copy_best():
+                tmp = best_target.with_suffix(best_target.suffix + ".tmp")
+                shutil.copy2(target_ckpt, tmp)
+                tmp.replace(best_target)
 
-                print(f"\n🎉 New best! Step {latest_event.step}: {current_loss:.4f} (saved to best_model.pth)\n")
-            else:
-                print(f"⚠️  New best found but checkpoint not yet saved: step {latest_event.step}")
+            import threading
+            t = threading.Thread(target=_copy_best, daemon=True)
+            t.start()
+            t.join()
+            with open(best_loss_file, 'w') as f:
+                f.write(f"{best_loss:.6f}")
+            with open(best_step_file, 'w') as f:
+                f.write(str(step))
+
+            print(
+                f"\n🎯 New best! step={step} metric={metric_name} loss={current_loss:.4f} "
+                f"(copied from {target_ckpt.name} -> {best_target.name})\n"
+            )
 
         time.sleep(30)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Resume training with fused AdamW from an existing checkpoint.
-# If FRESH_OPT=1, load only model weights and reset optimizer/scheduler (useful when changing LR/batch).
+# Resume training with MARS optimizer.
+# If FRESH_OPT=1, load only model weights (reset optimizer/scheduler) so new LR/WSD params apply.
 set -euo pipefail
 
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
@@ -10,10 +10,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Defaults
 CKPT="${CKPT:-/mnt/sda1/models/index-tts-ko/checkpoints/latest.pth}"
 FRESH_OPT="${FRESH_OPT:-0}"
-
-OPTIMIZER="${OPTIMIZER:-adamw}"
+OPTIMIZER="${OPTIMIZER:-mars}"
 SCHEDULER="${SCHEDULER:-wsd}"
 LR="${LR:-3e-5}"
 GRAD_CLIP="${GRAD_CLIP:-0.5}"
@@ -22,35 +22,27 @@ GRAD_ACC="${GRAD_ACC:-1}"
 AMP="${AMP:-1}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
-VAL_INTERVAL="${VAL_INTERVAL:-100}"
+VAL_INTERVAL="${VAL_INTERVAL:-10000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
-# Allow alias WSD_WARMUP for convenience
-if [[ -n "${WSD_WARMUP:-}" ]]; then
-  WARMUP_STEPS="${WSD_WARMUP}"
-fi
 MAX_STEPS="${MAX_STEPS:-0}"
 WSD_STABLE_RATIO="${WSD_STABLE_RATIO:-0.9}"
 WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO:-0.05}"
 DURATION_CONDITIONING="${DURATION_CONDITIONING:-length}"
+NO_AIM="${NO_AIM:-0}"
+# Force CPU checkpoint load? (1 to enable)
+CPU_CKPT_LOAD="${CPU_CKPT_LOAD:-1}"
 
-# Sanitize possible quoted CKPT
-CKPT="${CKPT%\"}"
-CKPT="${CKPT#\"}"
-CKPT="${CKPT%\'}"
-CKPT="${CKPT#\'}"
+# Allow alias WSD_WARMUP
+if [[ -n "${WSD_WARMUP:-}" ]]; then
+  WARMUP_STEPS="${WSD_WARMUP}"
+fi
 
 echo "Resuming from checkpoint: ${CKPT}"
 if [[ "${FRESH_OPT}" == "1" ]]; then
   echo "  -> FRESH_OPT=1: optimizer/scheduler will NOT be resumed (model weights only)."
 else
   echo "  -> FRESH_OPT=0: optimizer/scheduler will be resumed."
-fi
-
-# Ensure checkpoint exists
-if [[ ! -f "${CKPT}" ]]; then
-  echo "[ERROR] CKPT not found: ${CKPT}" >&2
-  exit 1
 fi
 
 CMD_ENV=(
@@ -72,6 +64,15 @@ CMD_ENV=(
   RESUME="$( [[ \"${FRESH_OPT}\" == \"1\" ]] && echo \"\" || echo \"${CKPT}\" )"
   AMP="${AMP}"
   DURATION_CONDITIONING="${DURATION_CONDITIONING}"
+  CPU_CKPT_LOAD="${CPU_CKPT_LOAD}"
 )
 
-env "${CMD_ENV[@]}" "${SCRIPT_DIR}/ko_step4_train_gpt.sh"
+EXTRA_ARGS=()
+if [[ "${NO_AIM}" == "1" ]]; then
+  EXTRA_ARGS+=(--no-aim)
+fi
+if [[ "${CPU_CKPT_LOAD}" == "1" ]]; then
+  EXTRA_ARGS+=(--cpu-ckpt-load)
+fi
+
+env "${CMD_ENV[@]}" "${SCRIPT_DIR}/ko_step4_train_gpt.sh" "${EXTRA_ARGS[@]}"

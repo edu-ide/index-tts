@@ -11,9 +11,9 @@ sample record stores paths to:
 
 The model is optimised with cross-entropy losses over text tokens and semantic codes,
 with optional gradient accumulation and mixed-precision support. Checkpoints are
-emitted every 1k optimiser steps (`model_step{N}.pth`), keeping only the three most
-recent snapshots. TensorBoard summaries track losses and learning rate under the
-chosen output directory.
+emitted every 100 optimiser steps to `latest.pth` (light, model-only) and every
+1000 steps to `latest_full.pth` (full, with optimizer/scheduler). TensorBoard
+summaries track losses and learning rate under the chosen output directory.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from threading import Thread
 
 import numpy as np
 import torch
@@ -114,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=1000, help="LR warmup steps.")
     parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
     parser.add_argument("--log-interval", type=int, default=100, help="Steps between training log entries.")
-    parser.add_argument("--val-interval", type=int, default=0, help="Validation frequency in steps (0 = once per epoch).")
+    parser.add_argument("--val-interval", type=int, default=100, help="Validation frequency in steps (0 = once per epoch).")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping value.")
     parser.add_argument("--text-loss-weight", type=float, default=0.2, help="Weight for text CE loss.")
@@ -133,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         help="Force loading checkpoint to CPU instead of device (default: load to device for faster startup).",
     )
     # Clip-aware LR control
-    parser.add_argument("--clipaware-enable", dest="clipaware_enable", action="store_true", default=True, help="Enable clip-rate-aware LR decay (default: on).")
+    parser.add_argument("--clipaware-enable", dest="clipaware_enable", action="store_true", default=False, help="Enable clip-rate-aware LR decay (default: off).")
     parser.add_argument("--clipaware-disable", dest="clipaware_enable", action="store_false", help="Disable clip-rate-aware LR decay.")
     parser.add_argument("--clipaware-window", type=int, default=1000, help="Sliding window size for clip rate.")
     parser.add_argument("--clipaware-threshold", type=float, default=0.5, help="If clip rate >= threshold, decay LR.")
@@ -757,11 +758,15 @@ def compute_losses(
 
 
 def get_current_lr(optimizer: torch.optim.Optimizer, scheduler) -> float:
-    """Return the current learning rate, even when no scheduler is used."""
+    """
+    Return the current learning rate based on the optimizer state.
+    We prefer the optimizer's param group lr because clip-aware decay mutates it.
+    """
+    if len(optimizer.param_groups) > 0:
+        return optimizer.param_groups[0].get("lr", 0.0)
     if scheduler is not None:
         return scheduler.get_last_lr()[0]
-    # Fall back to first param group lr when running schedule-free
-    return optimizer.param_groups[0].get("lr", 0.0)
+    return 0.0
 
 
 def set_optimizer_train_mode(optimizer: torch.optim.Optimizer, is_train: bool) -> None:
@@ -817,6 +822,7 @@ class ClipAwareLRController:
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
+        scheduler=None,
         window: int = 1000,
         threshold: float = 0.5,
         decay: float = 0.5,
@@ -824,6 +830,7 @@ class ClipAwareLRController:
         cooldown: int = 500,
     ):
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.window = max(1, window)
         self.threshold = threshold
         self.decay = decay
@@ -847,10 +854,14 @@ class ClipAwareLRController:
         clip_rate = sum(self.clip_bools) / float(len(self.clip_bools))
         if clip_rate < self.threshold:
             return
-        for group in self.optimizer.param_groups:
+        for idx, group in enumerate(self.optimizer.param_groups):
             old_lr = group.get("lr", 0.0)
             new_lr = max(self.min_lr, old_lr * self.decay)
             group["lr"] = new_lr
+            # Keep scheduler base LRs in sync so future scheduler.step() respects this decay
+            if self.scheduler is not None and hasattr(self.scheduler, "base_lrs"):
+                if idx < len(self.scheduler.base_lrs):
+                    self.scheduler.base_lrs[idx] = new_lr
         self.last_decay_step = self.step_idx
         return True
 
@@ -888,6 +899,21 @@ def save_checkpoint(
     if extra:
         state["extra"] = extra
     torch.save(state, path)
+
+
+def async_save(state: dict, path: Path, previous: Thread | None = None) -> Thread:
+    """Save state to a temp file then atomically replace target. Joins previous if provided."""
+    if previous and previous.is_alive():
+        previous.join()
+
+    def _do_save():
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(state, tmp)
+        tmp.replace(path)
+
+    t = Thread(target=_do_save, daemon=True)
+    t.start()
+    return t
 
 
 def evaluate(model: UnifiedVoice, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
@@ -987,6 +1013,10 @@ def main() -> None:
             'base_checkpoint': str(args.base_checkpoint),
             'device': str(device),
             'output_dir': str(output_dir),
+            'optimizer': args.optimizer,
+            'scheduler': args.scheduler,
+            'wsd_stable_ratio': args.wsd_stable_ratio,
+            'wsd_min_lr_ratio': args.wsd_min_lr_ratio,
         }
         print(f"[Info] Aim initialized: experiment={args.aim_experiment}, run={aim_run_name}")
         print(f"[Info] View results: aim up --repo {args.aim_repo}")
@@ -1223,17 +1253,28 @@ def main() -> None:
     start_epoch = 0
     recent_checkpoints: List[str] = []
     last_saved_step: int | None = None
+    last_full_save_step: int | None = None
+    light_save_thread: Thread | None = None
+    full_save_thread: Thread | None = None
+    last_train_text_loss: float | None = None
+    last_train_mel_loss: float | None = None
+    last_val_text_loss: float | None = None
+    last_val_mel_loss: float | None = None
 
     resume_path: str | None = None
     resume_raw = (args.resume or "").strip()
     if resume_raw in ('', '""', "''"):
         resume_path = None
     elif resume_raw == "auto":
-        candidate = output_dir / "latest.pth"
-        if candidate.exists():
-            resume_path = str(candidate)
+        candidate_full = output_dir / "latest_full.pth"
+        candidate_light = output_dir / "latest.pth"
+        if candidate_full.exists():
+            resume_path = str(candidate_full)
+        elif candidate_light.exists():
+            resume_path = str(candidate_light)
     else:
-        resume_path = resume_raw
+        # Strip accidental wrapping quotes so torch.load gets a valid path
+        resume_path = resume_raw.strip("\"'")
     if resume_path:
         map_loc = device if not args.cpu_ckpt_load else "cpu"
         print(f"[Info] Loading checkpoint from {resume_path} to {map_loc} ...")
@@ -1247,9 +1288,9 @@ def main() -> None:
         model.load_state_dict(state_dict)
         print("[Info] Model state loaded successfully")
 
-        # Load optimizer state only if optimizer type matches
+        # Load optimizer state only if optimizer type matches and state exists
         ckpt_optimizer_type = checkpoint.get("optimizer_type", "adamw")  # Default to adamw for old checkpoints
-        if args.optimizer == ckpt_optimizer_type:
+        if args.optimizer == ckpt_optimizer_type and checkpoint.get("optimizer"):
             print(f"[Info] Loading {args.optimizer} optimizer state (matching checkpoint)")
             optimizer.load_state_dict(checkpoint["optimizer"])
         else:
@@ -1270,7 +1311,8 @@ def main() -> None:
     set_optimizer_train_mode(optimizer, True)
     optimizer.zero_grad(set_to_none=True)
 
-    save_every = 1000
+    save_every = 100  # light save (model only) every 100 steps
+    full_save_every = 1000  # full save (model + optimizer + scheduler + scaler) every 1000 steps
     best_val = math.inf
 
     # Training speed tracking
@@ -1284,6 +1326,7 @@ def main() -> None:
     if args.clipaware_enable:
         clip_controller = ClipAwareLRController(
             optimizer,
+            scheduler,
             window=args.clipaware_window,
             threshold=args.clipaware_threshold,
             decay=args.clipaware_decay,
@@ -1317,6 +1360,8 @@ def main() -> None:
                     enable_stage2_realtime_emo=args.enable_stage2_realtime_emo
                 )
                 loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
+                last_train_text_loss = text_loss.item()
+                last_train_mel_loss = mel_loss.item()
                 # Stage 2: Add speaker classification loss
                 if speaker_loss is not None:
                     loss = loss + args.speaker_loss_weight * speaker_loss
@@ -1498,6 +1543,8 @@ def main() -> None:
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
                     writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
                     writer.add_scalar("val/time_minutes", val_time_min, global_step)
+                    last_val_text_loss = val_metrics["text_loss"]
+                    last_val_mel_loss = val_metrics["mel_loss"]
 
                     # Aim logging
                     if use_aim:
@@ -1518,46 +1565,43 @@ def main() -> None:
                             aim_run.track(best_val, name='best_val_mel_loss', context={'metric': 'best'})
 
                 if global_step % save_every == 0:
-                    ckpt_path = output_dir / f"model_step{global_step}.pth"
-                    recent_checkpoints.append(str(ckpt_path))
-                    save_checkpoint(
-                        ckpt_path,
-                        model,
-                        optimizer,
-                        scheduler,
-                        scaler,
-                        epoch,
-                        global_step,
-                        recent_checkpoints,
-                        extra=checkpoint_extra("step"),
-                    )
-                    torch.save(
-                        {
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "optimizer_type": args.optimizer,  # Save optimizer type for resume
-                            "scheduler": scheduler.state_dict() if scheduler else None,
-                            "scaler": scaler.state_dict() if scaler else None,
-                            "epoch": epoch,
-                            "step": global_step,
-                            "recent_checkpoints": recent_checkpoints,
-                            "manifests": manifest_metadata,
-                        },
-                        output_dir / "latest.pth",
-                    )
+                    light_state = {
+                        "model": model.state_dict(),
+                        "epoch": epoch,
+                        "step": global_step,
+                        "recent_checkpoints": [],
+                        "manifests": manifest_metadata,
+                        "train_text_loss": last_train_text_loss,
+                        "train_mel_loss": last_train_mel_loss,
+                        "val_text_loss": last_val_text_loss,
+                        "val_mel_loss": last_val_mel_loss,
+                    }
+                    light_save_thread = async_save(light_state, output_dir / "latest.pth", light_save_thread)
 
-                    # Log checkpoint save to Aim
                     if use_aim:
-                        aim_run.track(global_step, name='checkpoint_saved', context={'checkpoint': 'latest'})
-                        print(f"[Info] Checkpoint saved at step {global_step}")
-
-                    while len(recent_checkpoints) > 3:
-                        obsolete = recent_checkpoints.pop(0)
-                        try:
-                            os.remove(obsolete)
-                        except OSError:
-                            pass
+                        aim_run.track(global_step, name='checkpoint_saved', context={'checkpoint': 'latest_light'})
                     last_saved_step = global_step
+
+                if global_step % full_save_every == 0:
+                    full_state = {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "optimizer_type": args.optimizer,
+                        "scheduler": scheduler.state_dict() if scheduler else None,
+                        "scaler": scaler.state_dict() if scaler else None,
+                        "epoch": epoch,
+                        "step": global_step,
+                        "recent_checkpoints": [],
+                        "manifests": manifest_metadata,
+                        "train_text_loss": last_train_text_loss,
+                        "train_mel_loss": last_train_mel_loss,
+                        "val_text_loss": last_val_text_loss,
+                        "val_mel_loss": last_val_mel_loss,
+                    }
+                    full_save_thread = async_save(full_state, output_dir / "latest_full.pth", full_save_thread)
+                    last_full_save_step = global_step
+                    if use_aim:
+                        aim_run.track(global_step, name='checkpoint_saved', context={'checkpoint': 'latest_full'})
 
                 # Reset data loading timer for next batch
                 batch_start_time = time.time()
@@ -1604,39 +1648,41 @@ def main() -> None:
 
 
     if global_step > 0 and last_saved_step != global_step:
-        ckpt_path = output_dir / f"model_step{global_step}.pth"
-        recent_checkpoints.append(str(ckpt_path))
-        save_checkpoint(
-            ckpt_path,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            global_step,
-            recent_checkpoints,
-            extra=checkpoint_extra("step-final"),
-        )
-        torch.save(
-            {
+        light_state = {
+            "model": model.state_dict(),
+            "epoch": epoch,
+            "step": global_step,
+            "recent_checkpoints": [],
+            "manifests": manifest_metadata,
+            "train_text_loss": last_train_text_loss,
+            "train_mel_loss": last_train_mel_loss,
+            "val_text_loss": last_val_text_loss,
+            "val_mel_loss": last_val_mel_loss,
+        }
+        light_save_thread = async_save(light_state, output_dir / "latest.pth", light_save_thread)
+
+        full_state = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "optimizer_type": args.optimizer,  # Save optimizer type for resume
+            "optimizer_type": args.optimizer,
             "scheduler": scheduler.state_dict() if scheduler else None,
             "scaler": scaler.state_dict() if scaler else None,
             "epoch": epoch,
             "step": global_step,
-            "recent_checkpoints": recent_checkpoints,
+            "recent_checkpoints": [],
             "manifests": manifest_metadata,
-            },
-            output_dir / "latest.pth",
-        )
-        while len(recent_checkpoints) > 3:
-            obsolete = recent_checkpoints.pop(0)
-            try:
-                os.remove(obsolete)
-            except OSError:
-                pass
+            "train_text_loss": last_train_text_loss,
+            "train_mel_loss": last_train_mel_loss,
+            "val_text_loss": last_val_text_loss,
+            "val_mel_loss": last_val_mel_loss,
+        }
+        full_save_thread = async_save(full_state, output_dir / "latest_full.pth", full_save_thread)
+
+    # Ensure pending async saves are finished
+    if light_save_thread and light_save_thread.is_alive():
+        light_save_thread.join()
+    if full_save_thread and full_save_thread.is_alive():
+        full_save_thread.join()
 
     # Finalize Aim run
     if use_aim:
