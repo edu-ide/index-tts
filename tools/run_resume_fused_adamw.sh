@@ -9,18 +9,17 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prefer full checkpoint to keep optimizer/scheduler; fall back to latest.pth only if full is missing
-DEFAULT_FULL="/mnt/sda1/models/index-tts-ko/checkpoints/latest_full.pth"
-DEFAULT_LIGHT="/mnt/sda1/models/index-tts-ko/checkpoints/latest.pth"
-
-if [[ -z "${CKPT:-}" ]]; then
-  if [[ -f "${DEFAULT_FULL}" ]]; then
-    CKPT="${DEFAULT_FULL}"
-  else
-    CKPT="${DEFAULT_LIGHT}"
-  fi
-fi
-FRESH_OPT="${FRESH_OPT:-0}"   # 0: resume optimizer/scheduler state
+# [Recovery Plan: AdamW Safe Mode]
+# MARS causes OOM, so we use AdamW.
+# Resume from latest checkpoint to continue training.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CKPT="${CKPT:-/mnt/sda1/models/index-tts-ko/checkpoints/latest_full.pth}"
+FRESH_OPT="${FRESH_OPT:-0}"  # Keep optimizer state
+LR="${LR:-5e-6}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+GRAD_ACC="${GRAD_ACC:-4}"  # Batch 8 * 4 = 32
+VAL_INTERVAL="${VAL_INTERVAL:-1000}" # Validate every 1000 steps
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-/mnt/sda1/models/IndexTTS-2/tokenizer_ko/ko_bpe.model}"
 
 # Strip accidental surrounding quotes
 CKPT="${CKPT%\"}"
@@ -31,4 +30,9 @@ CKPT="${CKPT#\'}"
 env \
   CKPT="${CKPT}" \
   FRESH_OPT="${FRESH_OPT}" \
+  LR="${LR}" \
+  BATCH_SIZE="${BATCH_SIZE}" \
+  GRAD_ACC="${GRAD_ACC}" \
+  VAL_INTERVAL="${VAL_INTERVAL}" \
+  TOKENIZER_MODEL="${TOKENIZER_MODEL}" \
   "${SCRIPT_DIR}/resume_ko_fused_adamw.sh"

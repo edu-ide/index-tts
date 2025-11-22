@@ -25,6 +25,7 @@ import os
 import random
 import datetime
 from dataclasses import dataclass
+import subprocess  # Added for async inference
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 from threading import Thread
@@ -921,7 +922,8 @@ def evaluate(model: UnifiedVoice, loader: DataLoader, device: torch.device, args
     totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
     count = 0
     with torch.no_grad():
-        for batch in loader:
+        for i, batch in enumerate(loader):
+            if i >= 50: break  # Limit validation to 50 batches (Subset Evaluation)
             # Evaluation uses pre-computed emo_vec for speed
             text_loss, mel_loss, metrics, _ = compute_losses(
                 model, batch, device, args, enable_stage2_realtime_emo=False
@@ -1313,6 +1315,7 @@ def main() -> None:
 
     save_every = 100  # light save (model only) every 100 steps
     full_save_every = 1000  # full save (model + optimizer + scheduler + scaler) every 1000 steps
+    # Track best validation text_loss
     best_val = math.inf
 
     # Training speed tracking
@@ -1558,11 +1561,54 @@ def main() -> None:
                         f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
                         f"mel_top1={val_metrics['mel_top1']:.4f} | val_time={val_time_min:.2f}min"
                     )
-                    if val_metrics["mel_loss"] < best_val:
-                        best_val = val_metrics["mel_loss"]
+                    if val_metrics["text_loss"] < best_val:
+                        best_val = val_metrics["text_loss"]
+                        print(f"[Info] New best validation text_loss: {best_val:.4f}. Saving best_model.pth...")
+                        
+                        best_state = {
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "optimizer_type": args.optimizer,
+                            "scheduler": scheduler.state_dict() if scheduler else None,
+                            "scaler": scaler.state_dict() if scaler else None,
+                            "epoch": epoch,
+                            "step": global_step,
+                            "recent_checkpoints": [],
+                            "manifests": manifest_metadata,
+                            "train_text_loss": text_loss.item(),
+                            "train_mel_loss": mel_loss.item(),
+                            "val_text_loss": val_metrics["text_loss"],
+                            "val_mel_loss": val_metrics["mel_loss"],
+                        }
+                        # Save synchronously to ensure best model is written
+                        torch.save(best_state, output_dir / "best_model.pth")
+                        
+                        # Trigger Async CPU Inference
+                        ref_audio = Path(args.output_dir).parent.parent / "examples/voice_01.wav" # Assuming standard structure
+                        # Fallback to absolute path if needed
+                        if not ref_audio.exists():
+                             ref_audio = Path("/mnt/sdc1/ws/workspace/monorepo/external/index-tts/examples/voice_01.wav")
+                        
+                        sample_out = output_dir / f"best_val_{best_val:.4f}.wav"
+                        print(f"[Info] Triggering CPU inference for sample: {sample_out}")
+                        
+                        # Calculate script path relative to this file (trainers/train_gpt_v2.py)
+                        # tools/ is at ../tools/ relative to trainers/
+                        project_root = Path(__file__).resolve().parent.parent
+                        infer_script = project_root / "tools/infer_cpu_sample.py"
+
+                        subprocess.Popen([
+                            "python", 
+                            str(infer_script),
+                            "--ckpt", str(output_dir / "best_model.pth"),
+                            "--text", "안녕하세요, 이것은 학습 중 생성된 샘플입니다.",
+                            "--ref-audio", str(ref_audio),
+                            "--output", str(sample_out)
+                        ], env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}) # Force CPU via env
+
                         # Track best validation loss in Aim
                         if use_aim:
-                            aim_run.track(best_val, name='best_val_mel_loss', context={'metric': 'best'})
+                            aim_run.track(best_val, name='best_val_text_loss', context={'metric': 'best'})
 
                 if global_step % save_every == 0:
                     light_state = {
@@ -1640,11 +1686,47 @@ def main() -> None:
                 f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
                 f"mel_top1={val_metrics['mel_top1']:.4f} | val_time={val_time_min:.2f}min"
             )
-            if val_metrics["mel_loss"] < best_val:
-                best_val = val_metrics["mel_loss"]
+            if val_metrics["text_loss"] < best_val:
+                best_val = val_metrics["text_loss"]
+                print(f"[Info] New best validation text_loss: {best_val:.4f}. Saving best_model.pth...")
+
+                best_state = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "optimizer_type": args.optimizer,
+                    "scheduler": scheduler.state_dict() if scheduler else None,
+                    "scaler": scaler.state_dict() if scaler else None,
+                    "epoch": epoch,
+                    "step": global_step,
+                    "recent_checkpoints": [],
+                    "manifests": manifest_metadata,
+                    "train_text_loss": last_train_text_loss,
+                    "train_mel_loss": last_train_mel_loss,
+                    "val_text_loss": val_metrics["text_loss"],
+                    "val_mel_loss": val_metrics["mel_loss"],
+                }
+                torch.save(best_state, output_dir / "best_model.pth")
+
+                # Trigger Async CPU Inference
+                ref_audio = Path("/mnt/sdc1/ws/workspace/monorepo/external/index-tts/examples/voice_01.wav")
+                sample_out = output_dir / f"best_val_{best_val:.4f}.wav"
+                print(f"[Info] Triggering CPU inference for sample: {sample_out}")
+                
+                project_root = Path(__file__).resolve().parent.parent
+                infer_script = project_root / "tools/infer_cpu_sample.py"
+
+                subprocess.Popen([
+                    "python", 
+                    str(infer_script),
+                    "--ckpt", str(output_dir / "best_model.pth"),
+                    "--text", "안녕하세요, 이것은 학습 중 생성된 샘플입니다.",
+                    "--ref-audio", str(ref_audio),
+                    "--output", str(sample_out)
+                ], env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+
                 # Track best validation loss in Aim
                 if use_aim:
-                    aim_run.track(best_val, name='best_val_mel_loss', context={'metric': 'best'})
+                    aim_run.track(best_val, name='best_val_text_loss', context={'metric': 'best'})
 
 
     if global_step > 0 and last_saved_step != global_step:

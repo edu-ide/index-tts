@@ -10,13 +10,16 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- Defaults (edit here if 필요) ----
-CKPT="${CKPT:-/mnt/sda1/models/index-tts-ko/checkpoints/model_step35000.pth}"
-FRESH_OPT="${FRESH_OPT:-1}"          # 1: optimizer/scheduler 리셋
-LR="${LR:-2e-5}"
-MAX_STEPS="${MAX_STEPS:-35000}"
-WSD_WARMUP="${WSD_WARMUP:-0}"
-WSD_STABLE_RATIO="${WSD_STABLE_RATIO:-0.27}"
-WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO:-0.05}"
+# [Recovery Plan: Restart from Base]
+# Step 351k was already overfitted.
+# We restart from the clean Base Model (IndexTTS-2/gpt.pth).
+CKPT="${CKPT:-/mnt/sda1/models/IndexTTS-2/gpt.pth}"
+FRESH_OPT="${FRESH_OPT:-1}"          # 1: Must reset optimizer for Base Model
+LR="${LR:-5e-6}"                     # Safe LR (1/4 of previous failed run)
+MAX_STEPS="${MAX_STEPS:-0}"          # Unlimited
+WSD_WARMUP="${WSD_WARMUP:-2000}"     # Warmup to adapt to MARS
+WSD_STABLE_RATIO="${WSD_STABLE_RATIO:-0.9}" # Long stable phase
+WSD_MIN_LR_RATIO="${WSD_MIN_LR_RATIO:-0.0}"
 OPTIMIZER="${OPTIMIZER:-mars}"
 SCHEDULER="${SCHEDULER:-wsd}"
 # Allow disabling Aim with NO_AIM=1

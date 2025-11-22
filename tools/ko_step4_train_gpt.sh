@@ -121,9 +121,10 @@ from pathlib import Path
 import torch
 
 ckpt_dir = Path("/mnt/sda1/models/index-tts-ko/checkpoints")
-latest_ckpt = ckpt_dir / "latest.pth"
+latest_light = ckpt_dir / "latest.pth"
+latest_full = ckpt_dir / "latest_full.pth"
 
-# Best model (loss 기준): keep only one best_model_stepXXXX.pth
+# Best model (loss 기준): keep only one best_model_stepXXXX.pth and best_model_stepXXXX_full.pth
 best_loss_file = ckpt_dir / "best_loss.txt"
 best_step_file = ckpt_dir / "best_step.txt"
 
@@ -142,13 +143,15 @@ print(f"  Current best loss: {best_loss if best_loss < float('inf') else 'inf'}"
 
 
 def extract_loss(ckpt: dict):
-    """Validation 우선: val_text_loss > val_mel_loss. 없으면 None 반환."""
+    """Validation 우선, 없으면 train loss로 폴백."""
     extra = ckpt.get("extra") or {}
     candidates = [
         ("val_text_loss", ckpt.get("val_text_loss")),
         ("val_mel_loss", ckpt.get("val_mel_loss")),
         ("val_text_loss", extra.get("val_text_loss")),
         ("val_mel_loss", extra.get("val_mel_loss")),
+        ("train_text_loss", ckpt.get("train_text_loss")),
+        ("train_mel_loss", ckpt.get("train_mel_loss")),
     ]
     for name, value in candidates:
         if value is not None:
@@ -159,52 +162,70 @@ def extract_loss(ckpt: dict):
     return None, None
 
 
-last_mtime = 0.0
+last_mtime_light = 0.0
+last_mtime_full = 0.0
 
 while True:
     try:
-        if not latest_ckpt.exists():
+        # 최신 스냅샷 여부 확인
+        light_exists = latest_light.exists()
+        full_exists = latest_full.exists()
+
+        if not light_exists and not full_exists:
             time.sleep(30)
             continue
 
-        mtime = latest_ckpt.stat().st_mtime
-        if mtime == last_mtime:
+        light_changed = False
+        full_changed = False
+        if light_exists:
+            mtime_l = latest_light.stat().st_mtime
+            if mtime_l != last_mtime_light:
+                last_mtime_light = mtime_l
+                light_changed = True
+        if full_exists:
+            mtime_f = latest_full.stat().st_mtime
+            if mtime_f != last_mtime_full:
+                last_mtime_full = mtime_f
+                full_changed = True
+
+        # 둘 다 안 바뀌었으면 skip
+        if not light_changed and not full_changed:
             time.sleep(30)
             continue
 
-        last_mtime = mtime
-
+        # 우선 loss 평가에는 light(모델만) 사용
         try:
-            ckpt = torch.load(latest_ckpt, map_location="cpu")
+            ckpt_light = torch.load(latest_light, map_location="cpu") if light_exists else None
         except Exception as load_err:
-            print(f"Error loading {latest_ckpt.name}: {load_err}")
+            print(f"Error loading {latest_light.name}: {load_err}")
+            ckpt_light = None
+
+        if ckpt_light is None:
             time.sleep(30)
             continue
 
-        metric_name, current_loss = extract_loss(ckpt)
+        metric_name, current_loss = extract_loss(ckpt_light)
         if metric_name is None:
             print("Warning: no validation loss found in checkpoint; waiting for next validation")
             time.sleep(30)
             continue
 
-        step = ckpt.get("step") or ckpt.get("global_step") or ckpt.get("epoch")
+        step = ckpt_light.get("step") or ckpt_light.get("global_step") or ckpt_light.get("epoch")
         if step is None:
             step = 0
 
         if current_loss < best_loss:
             best_loss = current_loss
 
-            # 기본 복사 대상은 latest.pth
-            target_ckpt = latest_ckpt
-            target_step = step
-
-            # BEST_STEP_ROUND > 0이면 rounding된 model_stepXXXX.pth가 있으면 우선 사용
-            # latest.pth만 유지하므로 rounding은 무시하고 latest 사용
-
-            # 이전 best 삭제 (legacy 이름도 제거)
+            # 이전 best 삭제
             for old_best in ckpt_dir.glob("best_model_step*.pth"):
                 try:
                     old_best.unlink()
+                except Exception:
+                    pass
+            for old_best_full in ckpt_dir.glob("best_model_step*_full.pth"):
+                try:
+                    old_best_full.unlink()
                 except Exception:
                     pass
             legacy = ckpt_dir / "best_model.pth"
@@ -214,26 +235,53 @@ while True:
                 except Exception:
                     pass
 
-            best_target = ckpt_dir / f"best_model_step{target_step}.pth"
+            best_target_light = ckpt_dir / f"best_model_step{step}.pth"
+            best_target_full = ckpt_dir / f"best_model_step{step}_full.pth"
 
-            # 비동기 + 원자적 교체: tmp에 저장 후 rename
-            def _copy_best():
-                tmp = best_target.with_suffix(best_target.suffix + ".tmp")
-                shutil.copy2(target_ckpt, tmp)
-                tmp.replace(best_target)
+            def _copy(src: Path, dst: Path):
+                tmp = dst.with_suffix(dst.suffix + ".tmp")
+                shutil.copy2(src, tmp)
+                tmp.replace(dst)
 
             import threading
-            t = threading.Thread(target=_copy_best, daemon=True)
-            t.start()
-            t.join()
+
+            # light 저장
+            if light_exists:
+                t1 = threading.Thread(target=_copy, args=(latest_light, best_target_light), daemon=True)
+                t1.start()
+                t1.join()
+
+            # full 저장 (full이 존재하고 step이 일치할 때만)
+            if full_exists:
+                try:
+                    ckpt_full = torch.load(latest_full, map_location="cpu")
+                    full_step = ckpt_full.get("step") or ckpt_full.get("global_step") or ckpt_full.get("epoch") or 0
+                    if full_step == step:
+                        t2 = threading.Thread(target=_copy, args=(latest_full, best_target_full), daemon=True)
+                        t2.start()
+                        t2.join()
+                    else:
+                        # 스텝이 안 맞아도 최소한 최신 full 스냅샷을 best_model_full.pth 로 보관
+                        fallback_full = ckpt_dir / "best_model_full.pth"
+                        t2 = threading.Thread(target=_copy, args=(latest_full, fallback_full), daemon=True)
+                        t2.start()
+                        t2.join()
+                        print(f"[Best Monitor] latest_full step={full_step} != best step={step}; saved fallback {fallback_full.name}.")
+                except Exception as e:
+                    print(f"[Best Monitor] Failed to copy full checkpoint: {e}")
+
             with open(best_loss_file, 'w') as f:
                 f.write(f"{best_loss:.6f}")
             with open(best_step_file, 'w') as f:
                 f.write(str(step))
 
+            copied = f" -> {best_target_light.name}"
+            if best_target_full.exists():
+                copied += f", {best_target_full.name}"
+
             print(
                 f"\n🎯 New best! step={step} metric={metric_name} loss={current_loss:.4f} "
-                f"(copied from {target_ckpt.name} -> {best_target.name})\n"
+                f"(copied from latest.pth{copied})\n"
             )
 
         time.sleep(30)
@@ -270,6 +318,11 @@ if [[ -f "/mnt/sda1/models/index-tts-ko/checkpoints/best_loss.txt" ]]; then
     echo "🪜 Best step: ${best_step}"
     if [[ -f "/mnt/sda1/models/index-tts-ko/checkpoints/best_model_step${best_step}.pth" ]]; then
       echo "📁 Best checkpoint: /mnt/sda1/models/index-tts-ko/checkpoints/best_model_step${best_step}.pth"
+    fi
+    if [[ -f "/mnt/sda1/models/index-tts-ko/checkpoints/best_model_step${best_step}_full.pth" ]]; then
+      echo "📁 Best checkpoint (full): /mnt/sda1/models/index-tts-ko/checkpoints/best_model_step${best_step}_full.pth"
+    elif [[ -f "/mnt/sda1/models/index-tts-ko/checkpoints/best_model_full.pth" ]]; then
+      echo "📁 Best checkpoint (full fallback): /mnt/sda1/models/index-tts-ko/checkpoints/best_model_full.pth"
     fi
   fi
 fi
