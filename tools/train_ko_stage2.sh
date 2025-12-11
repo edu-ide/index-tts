@@ -45,7 +45,7 @@ SPEAKER_MAPPING="${SPEAKER_MAPPING:-/mnt/sda1/models/index-tts-ko/speaker_mappin
 
 # Model config
 CONFIG="${CONFIG:-/mnt/sda1/models/IndexTTS-2/config.yaml}"
-TOKENIZER="${TOKENIZER:-/mnt/sda1/models/IndexTTS-2/tokenizer.model}"
+TOKENIZER="${TOKENIZER:-/mnt/sda1/models/IndexTTS-2/tokenizer_ko/ko_bpe.model}"
 
 # Training hyperparameters (IndexTTS2 논문 기반)
 BATCH_SIZE="${BATCH_SIZE:-8}"
@@ -63,6 +63,7 @@ GRL_SCHEDULE="${GRL_SCHEDULE:-exponential}"
 # Logging
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 VAL_INTERVAL="${VAL_INTERVAL:-1000}"
+NUM_WORKERS="${NUM_WORKERS:-32}"
 
 # ============================================================
 # Validation
@@ -96,7 +97,7 @@ if [[ ! -f "${SPEAKER_MAPPING}" ]]; then
   echo "" >&2
   echo "Speaker mapping을 먼저 생성해야 합니다:" >&2
   echo "  python tools/build_speaker_mapping.py \\" >&2
-  echo "    --manifest ${DATASET_DIR}/train_manifest.jsonl \\" >&2
+  echo "    --manifest ${DATASET_DIR}/gpt_pairs_train.jsonl \\" >&2
   echo "    --output ${SPEAKER_MAPPING} \\" >&2
   echo "    --top-k 500 \\" >&2
   echo "    --min-samples 50" >&2
@@ -118,7 +119,7 @@ echo ""
 
 echo "📊 Stage 2 하이퍼파라미터:"
 echo "  - Batch Size: ${BATCH_SIZE}"
-echo "  - Gradient Accumulation: ${GRAD_ACC} (실효 batch ${((BATCH_SIZE * GRAD_ACC))})"
+echo "  - Gradient Accumulation: ${GRAD_ACC} (실효 batch $((BATCH_SIZE * GRAD_ACC)))"
 echo "  - Learning Rate: ${LR}"
 echo "  - Warmup Steps: ${WARMUP_STEPS}"
 echo "  - Epochs: ${EPOCHS}"
@@ -161,29 +162,28 @@ echo ""
 
 echo ""
 echo "================================================================"
-echo "✅ Stage 2 학습 시작 (Real-time Emo-Vec Computation)"
+echo "✅ Stage 2 학습 시작 (GRL + Pre-computed Emo-Vec)"
 echo "================================================================"
 echo ""
 echo "📊 주요 변경사항:"
 echo "  ✅ GRL + Speaker Classifier 통합 완료"
 echo "  ✅ Speaker classification loss 추가 완료"
-echo "  ✅ Stage 2 command-line arguments 추가 완료"
-echo "  ✅ Speaker mapping 로드 완료"
-echo "  ✅ Real-time emo_vec computation 활성화"
+echo "  ✅ Speaker mapping 로드 완료 (500 speakers)"
 echo ""
-echo "🎯 Real-time Emo-Vec 방식:"
-echo "  - Condition (mel-spectrogram) → Emo Encoder → Emo_vec"
-echo "  - Gradient가 emo encoder로 흐름 → 진정한 adversarial training"
-echo "  - GRL이 emo encoder 학습에 직접 영향"
-echo "  - IndexTTS2 논문의 이상적인 구현 방식"
+echo "🎯 GRL 방식:"
+echo "  - Pre-computed emo_vec 사용 (Wav2Vec2-BERT 피처)"
+echo "  - GRL이 emo_vec에서 speaker identity 제거"
+echo "  - Speaker classifier로 adversarial training"
 echo ""
 echo "================================================================"
 echo ""
 
-# Stage 2 Training with GRL and Real-time Emo-Vec
-python trainers/train_gpt_v2.py \
-    --train-manifest ${DATASET_DIR}/train_manifest.jsonl \
-    --val-manifest ${DATASET_DIR}/val_manifest.jsonl \
+# Stage 2 Training with GRL and Real-time Mel Computation (Paper Approach)
+# IndexTTS2 논문 방식: Audio → Mel → emo_conditioning_encoder → GRL
+# 이 방식은 gradient가 emo encoder를 통해 흐르므로 proper adversarial training 가능
+python "${PROJECT_ROOT}/trainers/train_gpt_v2.py" \
+    --train-manifest ${DATASET_DIR}/gpt_pairs_train.jsonl \
+    --val-manifest ${DATASET_DIR}/gpt_pairs_val.jsonl \
     --tokenizer ${TOKENIZER} \
     --config ${CONFIG} \
     --base-checkpoint ${STAGE1_CHECKPOINT} \
@@ -199,8 +199,10 @@ python trainers/train_gpt_v2.py \
     --grl-lambda ${GRL_LAMBDA} \
     --speaker-loss-weight ${SPEAKER_LOSS_WEIGHT} \
     --enable-stage2-realtime-emo \
+    --emo-mel-input-size 80 \
     --log-interval ${LOG_INTERVAL} \
-    --val-interval ${VAL_INTERVAL}
+    --val-interval ${VAL_INTERVAL} \
+    --num-workers ${NUM_WORKERS}
 
 echo ""
 echo "================================================================"

@@ -12,7 +12,7 @@ sample record stores paths to:
 The model is optimised with cross-entropy losses over text tokens and semantic codes,
 with optional gradient accumulation and mixed-precision support. Checkpoints are
 emitted every 100 optimiser steps to `latest.pth` (light, model-only) and every
-1000 steps to `latest_full.pth` (full, with optimizer/scheduler). TensorBoard
+val_interval steps to `latest_full.pth` (full, with optimizer/scheduler). TensorBoard
 summaries track losses and learning rate under the chosen output directory.
 """
 
@@ -33,6 +33,8 @@ from threading import Thread
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchaudio
+import torchaudio.transforms as T
 from torch import nn
 from torch.optim import AdamW
 from prodigyopt import Prodigy
@@ -43,6 +45,7 @@ from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
+from indextts.gpt.gradient_reversal import get_lambda_schedule
 from indextts.utils.typical_sampling import TypicalLogitsWarper
 
 try:
@@ -78,6 +81,153 @@ try:
 except ImportError:
     AIM_AVAILABLE = False
     print("[Warning] aim not installed. Run: pip install aim")
+
+
+# ============================================================================
+# Stage 2: Mel Computation for Real-time Emotion Encoding
+# ============================================================================
+class MelComputer:
+    """
+    Compute mel-spectrograms from audio files for Stage 2 GRL training.
+
+    Paper approach: Audio → Mel → emo_conditioning_encoder → emo_perceiver → GRL
+    This allows gradient flow through the emotion encoder for proper adversarial training.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 22050,
+        n_mels: int = 80,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+        f_min: float = 0.0,
+        f_max: Optional[float] = None,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.device = device
+
+        # Mel-spectrogram transform (will be created on target device)
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            f_min=f_min,
+            f_max=f_max,
+            power=2.0,
+            normalized=False,
+        ).to(device)
+
+        # Resampler cache (created on demand)
+        self._resamplers: Dict[int, T.Resample] = {}
+
+    def _get_resampler(self, orig_sr: int) -> T.Resample:
+        """Get or create a resampler for the given original sample rate."""
+        if orig_sr not in self._resamplers:
+            self._resamplers[orig_sr] = T.Resample(
+                orig_freq=orig_sr, new_freq=self.sample_rate
+            ).to(self.device)
+        return self._resamplers[orig_sr]
+
+    def load_and_compute_mel(self, audio_path: str) -> Optional[torch.Tensor]:
+        """
+        Load audio and compute mel-spectrogram.
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            Mel-spectrogram tensor [time, n_mels] or None if failed
+        """
+        try:
+            # Load audio
+            waveform, sr = torchaudio.load(audio_path)
+
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+            # Move to device
+            waveform = waveform.to(self.device)
+
+            # Resample if needed
+            if sr != self.sample_rate:
+                resampler = self._get_resampler(sr)
+                waveform = resampler(waveform)
+
+            # Compute mel-spectrogram: [1, n_mels, time]
+            mel = self.mel_transform(waveform)
+
+            # Convert to log scale
+            mel = torch.log(torch.clamp(mel, min=1e-5))
+
+            # Remove batch dim and transpose to [time, n_mels]
+            mel = mel.squeeze(0).transpose(0, 1)
+
+            return mel
+
+        except Exception as e:
+            print(f"[Warning] Failed to compute mel for {audio_path}: {e}")
+            return None
+
+    def compute_batch_mel(
+        self,
+        audio_paths: List[str],
+        max_mel_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute mel-spectrograms for a batch of audio files.
+        All files must succeed - raises error on any failure.
+
+        Args:
+            audio_paths: List of audio file paths
+            max_mel_len: Maximum mel length (for padding). If None, use max in batch.
+
+        Returns:
+            Tuple of (mel_batch, mel_lengths)
+            mel_batch: [batch, time, n_mels]
+            mel_lengths: [batch]
+
+        Raises:
+            RuntimeError: If any audio file fails to load or compute mel
+        """
+        mels = []
+        mel_lengths = []
+
+        for i, path in enumerate(audio_paths):
+            if not path:
+                raise RuntimeError(f"Empty audio path at index {i}")
+            mel = self.load_and_compute_mel(path)
+            if mel is None:
+                raise RuntimeError(f"Failed to compute mel for: {path}")
+            mels.append(mel)
+            mel_lengths.append(mel.shape[0])
+
+        # Determine padding length
+        if max_mel_len is None:
+            max_mel_len = max(mel_lengths)
+
+        # Pad mels to same length
+        padded_mels = []
+        for mel in mels:
+            if mel.shape[0] < max_mel_len:
+                padding = torch.zeros(
+                    max_mel_len - mel.shape[0], self.n_mels,
+                    device=self.device, dtype=mel.dtype
+                )
+                mel = torch.cat([mel, padding], dim=0)
+            elif mel.shape[0] > max_mel_len:
+                mel = mel[:max_mel_len]
+            padded_mels.append(mel)
+
+        mel_batch = torch.stack(padded_mels, dim=0)  # [batch, time, n_mels]
+        mel_lengths_tensor = torch.tensor(mel_lengths, device=self.device, dtype=torch.long)
+
+        return mel_batch, mel_lengths_tensor
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speaker-loss-weight", type=float, default=0.1, help="Weight for speaker classification loss (Stage 2).")
     parser.add_argument("--grl-schedule", type=str, default="exponential", choices=["constant", "linear", "exponential"], help="GRL lambda scheduling (Stage 2).")
     parser.add_argument("--enable-stage2-realtime-emo", action="store_true", help="Compute emo_vec in real-time during Stage 2 for proper gradient flow through emo encoder.")
+    parser.add_argument("--emo-mel-input-size", type=int, default=80, help="Mel bands for emo encoder input (default: 80). Only used with --enable-stage2-realtime-emo.")
     # Stage 3 options
     parser.add_argument("--freeze-conditioners", action="store_true", help="Freeze feature conditioners (speaker + emotion perceiver) for Stage 3 fine-tuning.")
     return parser.parse_args()
@@ -214,6 +365,9 @@ class Sample:
     prompt_language: Optional[str] = None
     manifest_path: Optional[Path] = None
     speaker: Optional[str] = None  # Stage 2: Speaker name for GRL
+    audio_path: Optional[Path] = None  # Stage 2: Audio path for real-time mel computation
+    mel_path: Optional[Path] = None  # Stage 2: Pre-computed mel path (faster)
+    mel_len: Optional[int] = None  # Stage 2: Pre-computed mel length
 
 
 class JapaneseGPTDataset(Dataset):
@@ -288,6 +442,16 @@ class JapaneseGPTDataset(Dataset):
                         record.get("target_language") or record.get("language") or spec.language
                     )
                     prompt_language = self._normalize_language(record.get("prompt_language") or spec.language)
+
+                    # Stage 2: Load audio path for real-time mel computation
+                    audio_path_value = record.get("prompt_audio_path")
+                    audio_path = self._resolve_path(base_dir, audio_path_value) if audio_path_value else None
+
+                    # Stage 2: Load pre-computed mel path (faster than real-time)
+                    mel_path_value = record.get("prompt_mel_path")
+                    mel_path = self._resolve_path(base_dir, mel_path_value) if mel_path_value else None
+                    mel_len = int(record.get("prompt_mel_len", 0)) if mel_path_value else None
+
                     sample = Sample(
                         id=record["id"],
                         text_ids_path=self._resolve_path(base_dir, record["target_text_ids_path"]),
@@ -304,6 +468,9 @@ class JapaneseGPTDataset(Dataset):
                         prompt_language=prompt_language,
                         manifest_path=manifest_path,
                         speaker=record.get("speaker"),  # Stage 2: Load speaker name
+                        audio_path=audio_path,  # Stage 2: Load audio path for mel
+                        mel_path=mel_path,  # Stage 2: Pre-computed mel path
+                        mel_len=mel_len,  # Stage 2: Pre-computed mel length
                     )
                 else:
                     language = self._normalize_language(record.get("language") or spec.language)
@@ -396,10 +563,21 @@ class JapaneseGPTDataset(Dataset):
                 continue
 
             try:
+                # Stage 2: Check audio file exists before loading other features
+                if sample.audio_path and not sample.audio_path.exists():
+                    raise FileNotFoundError(f"Audio file not found: {sample.audio_path}")
+
                 text_ids = np.load(sample.text_ids_path, allow_pickle=False)
                 codes = np.load(sample.codes_path, allow_pickle=False)
                 condition = np.load(sample.condition_path, allow_pickle=False)
                 emo_vec = np.load(sample.emo_vec_path, allow_pickle=False)
+
+                # Stage 2: Load mel in DataLoader worker for GPU prefetch
+                mel_data = None
+                mel_len = 0
+                if sample.mel_path and sample.mel_path.exists():
+                    mel_data = np.load(sample.mel_path, allow_pickle=False).astype(np.float32, copy=False)
+                    mel_len = sample.mel_len if sample.mel_len else mel_data.shape[0]
 
                 if text_ids.size == 0 or codes.size == 0 or condition.size == 0 or emo_vec.size == 0:
                     raise ValueError("Encountered empty feature file.")
@@ -409,7 +587,7 @@ class JapaneseGPTDataset(Dataset):
                 condition = condition.astype(np.float32, copy=False)
                 emo_vec = emo_vec.astype(np.float32, copy=False)
 
-                return {
+                result = {
                     "id": sample.id,
                     "text_ids": torch.from_numpy(text_ids),
                     "codes": torch.from_numpy(codes),
@@ -424,7 +602,12 @@ class JapaneseGPTDataset(Dataset):
                     "prompt_language": sample.prompt_language,
                     "manifest_path": str(sample.manifest_path) if sample.manifest_path else "",
                     "speaker": sample.speaker,  # Stage 2: Speaker name
+                    "audio_path": str(sample.audio_path) if sample.audio_path else "",  # Stage 2: Audio path
+                    "mel": torch.from_numpy(mel_data) if mel_data is not None else None,  # Stage 2: Pre-computed mel
+                    "mel_len": mel_len,  # Stage 2: Mel length
                 }
+
+                return result
 
             except (FileNotFoundError, OSError, ValueError, EOFError) as exc:
                 if current_idx not in self.bad_indices:
@@ -468,8 +651,22 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     prompt_languages = [item.get("prompt_language") for item in batch]
     manifest_paths = [item.get("manifest_path") for item in batch]
     speakers = [item.get("speaker") for item in batch]  # Stage 2: Speaker names
+    audio_paths = [item.get("audio_path") for item in batch]  # Stage 2: Audio paths for mel
+    mel_tensors = [item.get("mel") for item in batch]  # Stage 2: Pre-computed mel tensors
+    mel_lens = [item.get("mel_len", 0) for item in batch]  # Stage 2: Pre-computed mel lengths
 
-    return {
+    # Stage 2: Pad mel tensors (pin_memory handled by DataLoader)
+    mel_batch = None
+    mel_lengths = None
+    if mel_tensors[0] is not None:
+        max_mel_len = max(m.shape[0] for m in mel_tensors)
+        n_mels = mel_tensors[0].shape[1]
+        mel_batch = torch.zeros(len(mel_tensors), max_mel_len, n_mels)
+        for i, m in enumerate(mel_tensors):
+            mel_batch[i, :m.shape[0], :] = m
+        mel_lengths = torch.tensor(mel_lens, dtype=torch.long)
+
+    result = {
         "ids": ids,
         "prompt_ids": prompt_ids,
         "target_ids": target_ids,
@@ -484,7 +681,12 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         "prompt_languages": prompt_languages,
         "manifest_paths": manifest_paths,
         "speakers": speakers,  # Stage 2: Speaker names
+        "audio_paths": audio_paths,  # Stage 2: Audio paths for mel (fallback)
+        "mel_batch": mel_batch,  # Stage 2: Pre-computed mel [batch, time, n_mels] pinned
+        "mel_lengths": mel_lengths,  # Stage 2: Mel lengths
     }
+
+    return result
 
 
 def load_tokenizer(tokenizer_path: Path) -> TextTokenizer:
@@ -503,18 +705,20 @@ def build_model(
     num_speakers: int = 500,
     grl_lambda: float = 1.0,
     load_ckpt_to_device: bool = True,
+    emo_mel_input_size: int | None = None,
 ) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
     if cfg.gpt.number_text_tokens != vocab_size:
         cfg.gpt.number_text_tokens = vocab_size
 
-    # Stage 2: Add GRL parameters
+    # Stage 2: Add GRL parameters and mel input for emo encoder
     model = UnifiedVoice(
         **cfg.gpt,
         enable_grl=enable_grl,
         num_speakers=num_speakers,
-        grl_lambda=grl_lambda
+        grl_lambda=grl_lambda,
+        emo_mel_input_size=emo_mel_input_size,
     )
     map_loc = device if load_ckpt_to_device else "cpu"
     checkpoint = torch.load(base_checkpoint, map_location=map_loc)
@@ -609,6 +813,7 @@ def compute_losses(
     speaker_to_id: Optional[Dict[str, int]] = None,
     speaker_loss_weight: float = 0.1,
     enable_stage2_realtime_emo: bool = False,
+    mel_computer: Optional[MelComputer] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], Optional[torch.Tensor]]:
     condition = batch["condition"].to(device)
     text_ids = batch["text_ids"].to(device)
@@ -621,24 +826,43 @@ def compute_losses(
     batch_size = text_ids.size(0)
     use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-    # Stage 2: Compute emo_vec in real-time from condition (mel-spectrogram)
-    # This allows gradients to flow through emo encoder and enables proper GRL training
+    # Stage 2: Compute emo_vec in real-time for proper gradient flow through emo encoder
+    # Paper approach: Audio → Mel → emo_conditioning_encoder → emo_perceiver → GRL
+    emo_vec_for_grl = None
     if enable_stage2_realtime_emo and hasattr(model, 'enable_grl') and model.enable_grl:
-        # condition: [batch, cond_len, 1024] -> transpose to [batch, 1024, cond_len]
-        condition_transposed = condition.transpose(1, 2)
+        # Stage 2: Use pre-computed mel from DataLoader (already padded + pinned memory)
+        # This allows gradients to flow through emo encoder for proper adversarial training
+        mel_batch_prefetched = batch.get("mel_batch")
+        mel_lengths_prefetched = batch.get("mel_lengths")
+        audio_paths = batch.get("audio_paths", [])
 
-        # Pass through emo conditioning encoder to get emotion features
-        emo_features = model.emo_conditioning_encoder(condition_transposed, condition_lengths)
+        # Use prefetched mel from DataLoader (already pinned by DataLoader, async GPU transfer)
+        if mel_batch_prefetched is not None:
+            mel_batch = mel_batch_prefetched.to(device, non_blocking=True)
+            mel_lengths = mel_lengths_prefetched.to(device)
+        elif audio_paths and any(audio_paths):
+            # Fallback: compute mel from audio (slower, sequential)
+            if mel_computer is None:
+                raise RuntimeError("Stage 2 requires mel_computer but it is None")
+            mel_batch, mel_lengths = mel_computer.compute_batch_mel(audio_paths)
+        else:
+            raise RuntimeError(f"Stage 2 requires mel_batch or audio_paths but got neither")
+
+        # mel_batch: [batch, time, n_mels] - already on device from MelComputer
+        # Pass through emo conditioning encoder (expects [batch, time, n_mels])
+        # ConformerEncoder returns (output, masks) tuple
+        emo_features, _ = model.emo_conditioning_encoder(mel_batch, mel_lengths)
 
         # Pass through emo perceiver to get final emo_vec: [batch, 1, output_dim]
         emo_vec_raw = model.emo_perceiver_encoder(emo_features)
 
-        # Transform: [batch, 1, 1024] -> [batch, 1024] -> [batch, model_dim]
-        emo_vec_syn_ori = emo_vec_raw.squeeze(1)
-        emo_vec_syn = model.emovec_layer(emo_vec_syn_ori)
-        emo_vec = model.emo_layer(emo_vec_syn)
+        # Transform: [batch, 1, 512] -> [batch, 512] -> project to model_dim
+        # Note: emo_perceiver output is 1024 dim (from config)
+        emo_vec_syn_ori = emo_vec_raw.squeeze(1)  # [batch, 1024]
+        emo_vec_syn = model.emovec_layer(emo_vec_syn_ori)  # [batch, model_dim]
+        emo_vec = model.emo_layer(emo_vec_syn)  # [batch, model_dim]
 
-        # Store raw emo_vec for GRL (before final transformation)
+        # Store emo_vec for GRL (gradients flow through entire emo encoder)
         emo_vec_for_grl = emo_vec
     else:
         # Stage 1: Use pre-computed emo_vec
@@ -710,11 +934,23 @@ def compute_losses(
     if speaker_to_id is not None and hasattr(model, 'enable_grl') and model.enable_grl:
         speakers = batch.get("speakers", [])
         speaker_labels = []
+        valid_count = 0
+        invalid_count = 0
         for spk in speakers:
             if spk and spk in speaker_to_id:
                 speaker_labels.append(speaker_to_id[spk])
+                valid_count += 1
             else:
                 speaker_labels.append(-1)  # Ignore unknown speakers
+                invalid_count += 1
+
+        # Debug: Log speaker mapping status (once per 100 steps)
+        if hasattr(compute_losses, '_debug_counter'):
+            compute_losses._debug_counter += 1
+        else:
+            compute_losses._debug_counter = 0
+        if compute_losses._debug_counter % 100 == 0:
+            print(f"[DEBUG Speaker] valid={valid_count}, invalid={invalid_count}, sample_speakers={speakers[:3]}")
 
         speaker_labels_tensor = torch.tensor(speaker_labels, dtype=torch.long, device=device)
 
@@ -726,9 +962,11 @@ def compute_losses(
                     # Gradients will flow through emo encoder -> proper adversarial training
                     emo_vec_to_reverse = emo_vec_for_grl
                 else:
-                    # Fallback mode: Transform pre-computed emo_vec
-                    # This is a practical compromise when real-time computation is disabled
-                    emo_vec_to_reverse = model.emo_layer(model.emovec_layer(emo_vec_precomputed))
+                    # Fallback mode: Use pre-computed emo_vec directly
+                    # Pre-computed emo_vec is already 1280 dim (final output)
+                    # emovec_layer expects 1024 input, so we skip it
+                    # Only apply emo_layer (1280->1280) for consistency
+                    emo_vec_to_reverse = model.emo_layer(emo_vec_precomputed)
 
                 # Apply GRL: reverses gradients during backprop
                 emo_vec_reversed = model.grl(emo_vec_to_reverse)
@@ -745,9 +983,28 @@ def compute_losses(
                     reduction="mean"
                 )
                 metrics["speaker_loss"] = speaker_loss.item()
-                metrics["speaker_acc"] = (
-                    speaker_logits[valid_mask].argmax(dim=-1) == speaker_labels_tensor[valid_mask]
-                ).float().mean().item()
+
+                # Compute accuracy
+                preds = speaker_logits[valid_mask].argmax(dim=-1)
+                labels = speaker_labels_tensor[valid_mask]
+                correct = (preds == labels).float()
+                acc = correct.mean().item()
+                metrics["speaker_acc"] = acc
+
+                # Debug: Log classifier output stats (once per 100 steps)
+                if compute_losses._debug_counter % 100 == 0:
+                    unique_preds = preds.unique().numel()
+                    unique_labels = labels.unique().numel()
+                    logits_std = speaker_logits[valid_mask].std().item()
+                    logits_mean = speaker_logits[valid_mask].mean().item()
+                    # Check if all predictions are the same
+                    pred_counts = preds.bincount(minlength=speaker_logits.shape[-1])
+                    most_common_pred = pred_counts.argmax().item()
+                    most_common_count = pred_counts[most_common_pred].item()
+                    print(f"[DEBUG Acc] acc={acc:.4f}, correct={correct.sum().item()}/{len(correct)}, "
+                          f"unique_preds={unique_preds}, unique_labels={unique_labels}, "
+                          f"logits_std={logits_std:.4f}, logits_mean={logits_mean:.4f}, "
+                          f"most_pred={most_common_pred}({most_common_count}/{len(preds)})")
             else:
                 speaker_loss = torch.tensor(0.0, device=device)
         except Exception as e:
@@ -917,26 +1174,43 @@ def async_save(state: dict, path: Path, previous: Thread | None = None) -> Threa
     return t
 
 
-def evaluate(model: UnifiedVoice, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> Dict[str, float]:
+def evaluate(
+    model: UnifiedVoice,
+    loader: DataLoader,
+    device: torch.device,
+    args: argparse.Namespace,
+    speaker_to_id: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
     model.eval()
-    totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
+    totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0, "speaker_loss": 0.0, "speaker_acc": 0.0}
     count = 0
+    speaker_count = 0
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if i >= 50: break  # Limit validation to 50 batches (Subset Evaluation)
             # Evaluation uses pre-computed emo_vec for speed
-            text_loss, mel_loss, metrics, _ = compute_losses(
-                model, batch, device, args, enable_stage2_realtime_emo=False
+            text_loss, mel_loss, metrics, speaker_loss = compute_losses(
+                model, batch, device, args, speaker_to_id=speaker_to_id, enable_stage2_realtime_emo=False
             )
             bsz = batch["text_ids"].size(0)
             totals["text_loss"] += text_loss.item() * bsz
             totals["mel_loss"] += mel_loss.item() * bsz
             totals["mel_top1"] += metrics["mel_top1"] * bsz
+            # Track speaker metrics if available
+            if speaker_loss is not None:
+                totals["speaker_loss"] += metrics.get("speaker_loss", 0.0) * bsz
+                totals["speaker_acc"] += metrics.get("speaker_acc", 0.0) * bsz
+                speaker_count += bsz
             count += bsz
     model.train()
     if count == 0:
         return {k: 0.0 for k in totals}
-    return {k: v / count for k, v in totals.items()}
+    result = {k: v / count for k, v in totals.items() if k not in ["speaker_loss", "speaker_acc"]}
+    # Only include speaker metrics if we had valid speaker data
+    if speaker_count > 0:
+        result["speaker_loss"] = totals["speaker_loss"] / speaker_count
+        result["speaker_acc"] = totals["speaker_acc"] / speaker_count
+    return result
 
 
 def main() -> None:
@@ -1038,6 +1312,9 @@ def main() -> None:
         print(f"[Stage 2] Loaded speaker mapping: {len(speaker_to_id)} speakers")
 
     tokenizer = load_tokenizer(args.tokenizer)
+    # Stage 2: Use mel input for emo encoder when real-time emo is enabled
+    emo_mel_size = args.emo_mel_input_size if args.enable_stage2_realtime_emo else None
+
     model = build_model(
         args.config,
         tokenizer,
@@ -1048,7 +1325,24 @@ def main() -> None:
         num_speakers=len(speaker_to_id) if speaker_to_id else 500,
         grl_lambda=args.grl_lambda,
         load_ckpt_to_device=not args.cpu_ckpt_load,
+        emo_mel_input_size=emo_mel_size,
     )
+
+    # Stage 2: Initialize mel computer for real-time emotion encoding
+    mel_computer = None
+    if args.enable_stage2_realtime_emo:
+        print(f"[Stage 2] Initializing MelComputer for real-time emotion encoding...")
+        print(f"  - Sample rate: 22050 Hz")
+        print(f"  - Mel bands: {args.emo_mel_input_size}")
+        mel_computer = MelComputer(
+            sample_rate=22050,
+            n_mels=args.emo_mel_input_size,
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            device=device,
+        )
+        print(f"  ✅ MelComputer initialized on {device}")
 
     # Apply Liger Kernel Optimization (Before compilation)
     if LIGER_AVAILABLE:
@@ -1067,6 +1361,31 @@ def main() -> None:
     # elif hasattr(model, "transformer") and hasattr(model.transformer, "gradient_checkpointing_enable"):
     #     print("[Info] Enabling Gradient Checkpointing for Transformer backbone")
     #     model.transformer.gradient_checkpointing_enable()
+
+    # Stage 2: Freeze ONLY speaker perceiver (emotion perceiver remains trainable for GRL)
+    if args.enable_grl and not args.freeze_conditioners:
+        print("[Stage 2] Freezing speaker perceiver only (emotion perceiver trainable for GRL)...")
+
+        # Freeze speaker conditioning encoder and perceiver
+        if hasattr(model, 'conditioning_encoder'):
+            for param in model.conditioning_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Speaker conditioning encoder frozen")
+
+        if hasattr(model, 'perceiver_encoder'):
+            for param in model.perceiver_encoder.parameters():
+                param.requires_grad = False
+            print("  ✅ Speaker perceiver encoder frozen")
+
+        # Emotion encoder/perceiver remain TRAINABLE (not frozen)
+        print("  🔥 Emotion conditioning encoder: TRAINABLE")
+        print("  🔥 Emotion perceiver encoder: TRAINABLE")
+        print("  🔥 Emovec/Emo layers: TRAINABLE")
+
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"[Stage 2] Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
 
     # Stage 3: Freeze feature conditioners (speaker + emotion perceiver)
     if args.freeze_conditioners:
@@ -1262,10 +1581,11 @@ def main() -> None:
     last_train_mel_loss: float | None = None
     last_val_text_loss: float | None = None
     last_val_mel_loss: float | None = None
+    checkpoint: dict | None = None  # Will be loaded if resuming
 
     resume_path: str | None = None
-    resume_raw = (args.resume or "").strip()
-    if resume_raw in ('', '""', "''"):
+    resume_raw = (args.resume or "").strip().lower()
+    if resume_raw in ('', '""', "''", 'none', 'no', 'false', '0'):
         resume_path = None
     elif resume_raw == "auto":
         candidate_full = output_dir / "latest_full.pth"
@@ -1314,9 +1634,34 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
 
     save_every = 100  # light save (model only) every 100 steps
-    full_save_every = 1000  # full save (model + optimizer + scheduler + scaler) every 1000 steps
-    # Track best validation text_loss
+    full_save_every = args.val_interval  # full save aligned with validation interval
+
+    # Best model criterion: weighted total val loss (text + mel)
+    best_metric_name = "val_total_loss"
+
+    # Recover best_val from checkpoint or existing best_model.pth (so resuming never clobbers a better model)
     best_val = math.inf
+    if resume_path and checkpoint is not None:
+        best_val = checkpoint.get(best_metric_name, math.inf)
+        if best_val < math.inf:
+            print(f"[Info] Restored best_val ({best_metric_name}) from checkpoint: {best_val:.4f}")
+    best_model_path = output_dir / "best_model.pth"
+    if best_model_path.exists():
+        try:
+            best_ckpt = torch.load(best_model_path, map_location="cpu")
+            best_val_from_file = best_ckpt.get(best_metric_name)
+            if best_val_from_file is not None and best_val_from_file < best_val:
+                best_val = best_val_from_file
+                print(f"[Info] Restored best_val ({best_metric_name}) from best_model.pth: {best_val:.4f}")
+        except Exception as e:
+            print(f"[Warn] Failed to read existing best_model.pth: {e}")
+
+    # Track best mel loss separately for audio quality
+    best_mel_val = math.inf
+    if resume_path and checkpoint is not None:
+        best_mel_val = checkpoint.get("val_mel_loss", math.inf)
+        if best_mel_val < math.inf:
+             print(f"[Info] Restored best_mel_val from checkpoint: {best_mel_val:.4f}")
 
     # Training speed tracking
     import time
@@ -1357,17 +1702,24 @@ def main() -> None:
             compute_start = time.time()
 
             # Use new torch.amp.autocast (PyTorch 2.4+)
-            with torch.amp.autocast('cuda', enabled=use_amp, dtype=torch.bfloat16 if use_amp else torch.float32):
-                text_loss, mel_loss, metrics, speaker_loss = compute_losses(
-                    model, batch, device, args, speaker_to_id, args.speaker_loss_weight,
-                    enable_stage2_realtime_emo=args.enable_stage2_realtime_emo
-                )
-                loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
-                last_train_text_loss = text_loss.item()
-                last_train_mel_loss = mel_loss.item()
-                # Stage 2: Add speaker classification loss
-                if speaker_loss is not None:
-                    loss = loss + args.speaker_loss_weight * speaker_loss
+            try:
+                with torch.amp.autocast('cuda', enabled=use_amp, dtype=torch.bfloat16 if use_amp else torch.float32):
+                    text_loss, mel_loss, metrics, speaker_loss = compute_losses(
+                        model, batch, device, args, speaker_to_id, args.speaker_loss_weight,
+                        enable_stage2_realtime_emo=args.enable_stage2_realtime_emo,
+                        mel_computer=mel_computer,
+                    )
+                    loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
+                    last_train_text_loss = text_loss.item()
+                    last_train_mel_loss = mel_loss.item()
+                    # Stage 2: Add speaker classification loss
+                    if speaker_loss is not None:
+                        loss = loss + args.speaker_loss_weight * speaker_loss
+            except RuntimeError as e:
+                if "Mel computation failed" in str(e) or "Failed to compute mel" in str(e):
+                    print(f"[Warning] Skipping batch due to mel error: {e}")
+                    continue
+                raise  # Re-raise other RuntimeErrors
 
             if use_amp:
                 scaler.scale(loss / args.grad_accumulation).backward()
@@ -1434,6 +1786,16 @@ def main() -> None:
 
                 global_step += 1
 
+                # GRL lambda scheduling (Ganin et al. 2016)
+                current_grl_lambda = None
+                if hasattr(model, 'grl') and model.grl is not None and args.enable_grl:
+                    current_grl_lambda = get_lambda_schedule(
+                        global_step, total_steps, schedule=args.grl_schedule
+                    )
+                    # Scale by initial grl_lambda (default 1.0)
+                    current_grl_lambda = current_grl_lambda * args.grl_lambda
+                    model.grl.set_lambda(current_grl_lambda)
+
                 if global_step % args.log_interval == 0:
                     # Calculate training speed metrics
                     current_time = time.time()
@@ -1487,6 +1849,10 @@ def main() -> None:
                         if "speaker_acc" in metrics:
                             writer.add_scalar("train/speaker_acc", metrics["speaker_acc"], global_step)
 
+                    # Stage 2: Log GRL lambda (Ganin scheduling)
+                    if current_grl_lambda is not None:
+                        writer.add_scalar("train/grl_lambda", current_grl_lambda, global_step)
+
                     # Aim logging
                     if use_aim:
                         aim_run.track(text_loss.item(), name='text_loss', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
@@ -1510,6 +1876,10 @@ def main() -> None:
                             if "speaker_acc" in metrics:
                                 aim_run.track(metrics["speaker_acc"], name='speaker_acc', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
 
+                        # Stage 2: Track GRL lambda (Ganin scheduling)
+                        if current_grl_lambda is not None:
+                            aim_run.track(current_grl_lambda, name='grl_lambda', context={'subset': 'train'}, step=global_step, epoch=epoch + 1)
+
                     # Build log message
                     log_msg = (
                         f"[Train] epoch={epoch + 1} step={global_step} "
@@ -1520,6 +1890,8 @@ def main() -> None:
                         log_msg += f" speaker_loss={speaker_loss.item():.4f}"
                         if "speaker_acc" in metrics:
                             log_msg += f" speaker_acc={metrics['speaker_acc']:.4f}"
+                    if current_grl_lambda is not None:
+                        log_msg += f" λ_grl={current_grl_lambda:.4f}"
                     log_msg += f" lr={current_lr:.2e}"
                     log_msg += f" | {steps_per_min:.1f}steps/min {samples_per_sec:.1f}samples/s {time_per_step:.2f}s/step ETA:{eta_hours:.1f}h"
 
@@ -1538,14 +1910,21 @@ def main() -> None:
 
                 if args.val_interval > 0 and global_step > 0 and global_step % args.val_interval == 0:
                     val_start_time = time.time()
-                    val_metrics = evaluate(model, val_loader, device, args)
+                    val_metrics = evaluate(model, val_loader, device, args, speaker_to_id=speaker_to_id)
                     val_time = time.time() - val_start_time
                     val_time_min = val_time / 60
 
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
                     writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+                    # Combined validation loss (text + mel weights)
+                    val_total_loss = args.text_loss_weight * val_metrics["text_loss"] + args.mel_loss_weight * val_metrics["mel_loss"]
+                    writer.add_scalar("val/total_loss", val_total_loss, global_step)
                     writer.add_scalar("val/time_minutes", val_time_min, global_step)
+                    # Stage 2: Log val speaker metrics
+                    if "speaker_loss" in val_metrics:
+                        writer.add_scalar("val/speaker_loss", val_metrics["speaker_loss"], global_step)
+                        writer.add_scalar("val/speaker_acc", val_metrics["speaker_acc"], global_step)
                     last_val_text_loss = val_metrics["text_loss"]
                     last_val_mel_loss = val_metrics["mel_loss"]
 
@@ -1553,17 +1932,30 @@ def main() -> None:
                     if use_aim:
                         aim_run.track(val_metrics["text_loss"], name='text_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
                         aim_run.track(val_metrics["mel_loss"], name='mel_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                        aim_run.track(val_total_loss, name='total_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
                         aim_run.track(val_metrics["mel_top1"], name='mel_top1', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
                         aim_run.track(val_time_min, name='val_time_minutes', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                        # Stage 2: Track val speaker metrics in Aim
+                        if "speaker_loss" in val_metrics:
+                            aim_run.track(val_metrics["speaker_loss"], name='speaker_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                            aim_run.track(val_metrics["speaker_acc"], name='speaker_acc', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
 
-                    print(
+                    val_log_msg = (
                         f"[Val] epoch={epoch + 1} step={global_step} "
                         f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
-                        f"mel_top1={val_metrics['mel_top1']:.4f} | val_time={val_time_min:.2f}min"
+                        f"total_loss={val_total_loss:.4f} "
+                        f"mel_top1={val_metrics['mel_top1']:.4f}"
                     )
-                    if val_metrics["text_loss"] < best_val:
-                        best_val = val_metrics["text_loss"]
-                        print(f"[Info] New best validation text_loss: {best_val:.4f}. Saving best_model.pth...")
+                    if "speaker_loss" in val_metrics:
+                        val_log_msg += f" speaker_loss={val_metrics['speaker_loss']:.4f} speaker_acc={val_metrics['speaker_acc']:.4f}"
+                    val_log_msg += f" | val_time={val_time_min:.2f}min"
+                    print(val_log_msg)
+
+                    # Use weighted total validation loss for best model selection
+                    current_metric = val_total_loss
+                    if current_metric < best_val:
+                        best_val = current_metric
+                        print(f"[Info] New best {best_metric_name}: {best_val:.4f}. Saving best_model.pth...")
                         
                         best_state = {
                             "model": model.state_dict(),
@@ -1579,36 +1971,63 @@ def main() -> None:
                             "train_mel_loss": mel_loss.item(),
                             "val_text_loss": val_metrics["text_loss"],
                             "val_mel_loss": val_metrics["mel_loss"],
+                            "val_total_loss": val_total_loss,
+                            "val_speaker_loss": val_metrics.get("speaker_loss"),
+                            "val_speaker_acc": val_metrics.get("speaker_acc"),
                         }
                         # Save synchronously to ensure best model is written
                         torch.save(best_state, output_dir / "best_model.pth")
-                        
+
                         # Trigger Async CPU Inference
                         ref_audio = Path(args.output_dir).parent.parent / "examples/voice_01.wav" # Assuming standard structure
                         # Fallback to absolute path if needed
                         if not ref_audio.exists():
                              ref_audio = Path("/mnt/sdc1/ws/workspace/monorepo/external/index-tts/examples/voice_01.wav")
-                        
-                        sample_out = output_dir / f"best_val_{best_val:.4f}.wav"
+
+                        sample_out = output_dir / f"best_{best_metric_name.replace('val_', '')}_{best_val:.4f}.wav"
                         print(f"[Info] Triggering CPU inference for sample: {sample_out}")
-                        
+
                         # Calculate script path relative to this file (trainers/train_gpt_v2.py)
                         # tools/ is at ../tools/ relative to trainers/
                         project_root = Path(__file__).resolve().parent.parent
                         infer_script = project_root / "tools/infer_cpu_sample.py"
 
                         subprocess.Popen([
-                            "python", 
+                            "python",
                             str(infer_script),
                             "--ckpt", str(output_dir / "best_model.pth"),
                             "--text", "안녕하세요, 이것은 학습 중 생성된 샘플입니다.",
                             "--ref-audio", str(ref_audio),
-                            "--output", str(sample_out)
+                            "--output", str(sample_out),
+                            "--model-dir", str(args.config).replace("/config.yaml", ""),  # Use same config dir as training
+                            "--config", str(args.config),
                         ], env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}) # Force CPU via env
 
                         # Track best validation loss in Aim
                         if use_aim:
-                            aim_run.track(best_val, name='best_val_text_loss', context={'metric': 'best'})
+                            aim_run.track(best_val, name=f'best_{best_metric_name}', context={'metric': 'best'})
+
+                    # Also save best audio model based on mel_loss (for quality)
+                    if val_metrics["mel_loss"] < best_mel_val:
+                        best_mel_val = val_metrics["mel_loss"]
+                        print(f"[Info] New best val_mel_loss: {best_mel_val:.4f}. Saving best_audio_model.pth...")
+                        best_audio_state = {
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "optimizer_type": args.optimizer,
+                            "scheduler": scheduler.state_dict() if scheduler else None,
+                            "scaler": scaler.state_dict() if scaler else None,
+                            "epoch": epoch,
+                            "step": global_step,
+                            "recent_checkpoints": [],
+                            "manifests": manifest_metadata,
+                            "train_text_loss": text_loss.item(),
+                            "train_mel_loss": mel_loss.item(),
+                            "val_text_loss": val_metrics["text_loss"],
+                            "val_mel_loss": val_metrics["mel_loss"],
+                            "val_speaker_loss": val_metrics.get("speaker_loss"),
+                        }
+                        torch.save(best_audio_state, output_dir / "best_audio_model.pth")
 
                 if global_step % save_every == 0:
                     light_state = {
@@ -1664,7 +2083,7 @@ def main() -> None:
         if args.val_interval == 0:
             val_start_time = time.time()
             set_optimizer_train_mode(optimizer, False)
-            val_metrics = evaluate(model, val_loader, device, args)
+            val_metrics = evaluate(model, val_loader, device, args, speaker_to_id=speaker_to_id)
             set_optimizer_train_mode(optimizer, True)
             val_time = time.time() - val_start_time
             val_time_min = val_time / 60
@@ -1673,6 +2092,10 @@ def main() -> None:
             writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
             writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
             writer.add_scalar("val/time_minutes", val_time_min, global_step)
+            # Stage 2: Log val speaker metrics
+            if "speaker_loss" in val_metrics:
+                writer.add_scalar("val/speaker_loss", val_metrics["speaker_loss"], global_step)
+                writer.add_scalar("val/speaker_acc", val_metrics["speaker_acc"], global_step)
 
             # Aim logging for end-of-epoch validation
             if use_aim:
@@ -1680,15 +2103,26 @@ def main() -> None:
                 aim_run.track(val_metrics["mel_loss"], name='mel_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
                 aim_run.track(val_metrics["mel_top1"], name='mel_top1', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
                 aim_run.track(val_time_min, name='val_time_minutes', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                # Stage 2: Track val speaker metrics in Aim
+                if "speaker_loss" in val_metrics:
+                    aim_run.track(val_metrics["speaker_loss"], name='speaker_loss', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
+                    aim_run.track(val_metrics["speaker_acc"], name='speaker_acc', context={'subset': 'val'}, step=global_step, epoch=epoch + 1)
 
-            print(
+            val_log_msg = (
                 f"[Val] epoch={epoch + 1} step={global_step} "
                 f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
-                f"mel_top1={val_metrics['mel_top1']:.4f} | val_time={val_time_min:.2f}min"
+                f"mel_top1={val_metrics['mel_top1']:.4f}"
             )
-            if val_metrics["text_loss"] < best_val:
-                best_val = val_metrics["text_loss"]
-                print(f"[Info] New best validation text_loss: {best_val:.4f}. Saving best_model.pth...")
+            if "speaker_loss" in val_metrics:
+                val_log_msg += f" speaker_loss={val_metrics['speaker_loss']:.4f} speaker_acc={val_metrics['speaker_acc']:.4f}"
+            val_log_msg += f" | val_time={val_time_min:.2f}min"
+            print(val_log_msg)
+
+            # Stage 2 GRL: use speaker_loss, Stage 1: use text_loss
+            current_metric = val_metrics.get("speaker_loss", math.inf) if use_speaker_loss_criterion else val_metrics["text_loss"]
+            if current_metric < best_val:
+                best_val = current_metric
+                print(f"[Info] New best {best_metric_name}: {best_val:.4f}. Saving best_model.pth...")
 
                 best_state = {
                     "model": model.state_dict(),
@@ -1704,29 +2138,55 @@ def main() -> None:
                     "train_mel_loss": last_train_mel_loss,
                     "val_text_loss": val_metrics["text_loss"],
                     "val_mel_loss": val_metrics["mel_loss"],
+                    "val_speaker_loss": val_metrics.get("speaker_loss"),
+                    "val_speaker_acc": val_metrics.get("speaker_acc"),
                 }
                 torch.save(best_state, output_dir / "best_model.pth")
 
                 # Trigger Async CPU Inference
                 ref_audio = Path("/mnt/sdc1/ws/workspace/monorepo/external/index-tts/examples/voice_01.wav")
-                sample_out = output_dir / f"best_val_{best_val:.4f}.wav"
+                sample_out = output_dir / f"best_{best_metric_name.replace('val_', '')}_{best_val:.4f}.wav"
                 print(f"[Info] Triggering CPU inference for sample: {sample_out}")
-                
+
                 project_root = Path(__file__).resolve().parent.parent
                 infer_script = project_root / "tools/infer_cpu_sample.py"
 
                 subprocess.Popen([
-                    "python", 
+                    "python",
                     str(infer_script),
                     "--ckpt", str(output_dir / "best_model.pth"),
                     "--text", "안녕하세요, 이것은 학습 중 생성된 샘플입니다.",
                     "--ref-audio", str(ref_audio),
-                    "--output", str(sample_out)
+                    "--output", str(sample_out),
+                    "--model-dir", str(args.config).replace("/config.yaml", ""),  # Use same config dir as training
+                    "--config", str(args.config),
                 ], env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
 
                 # Track best validation loss in Aim
                 if use_aim:
-                    aim_run.track(best_val, name='best_val_text_loss', context={'metric': 'best'})
+                    aim_run.track(best_val, name=f'best_{best_metric_name}', context={'metric': 'best'})
+
+            # Also save best audio model based on mel_loss (for quality)
+            if val_metrics["mel_loss"] < best_mel_val:
+                best_mel_val = val_metrics["mel_loss"]
+                print(f"[Info] New best val_mel_loss: {best_mel_val:.4f}. Saving best_audio_model.pth...")
+                best_audio_state = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "optimizer_type": args.optimizer,
+                    "scheduler": scheduler.state_dict() if scheduler else None,
+                    "scaler": scaler.state_dict() if scaler else None,
+                    "epoch": epoch,
+                    "step": global_step,
+                    "recent_checkpoints": [],
+                    "manifests": manifest_metadata,
+                    "train_text_loss": last_train_text_loss,
+                    "train_mel_loss": last_train_mel_loss,
+                    "val_text_loss": val_metrics["text_loss"],
+                    "val_mel_loss": val_metrics["mel_loss"],
+                    "val_speaker_loss": val_metrics.get("speaker_loss"),
+                }
+                torch.save(best_audio_state, output_dir / "best_audio_model.pth")
 
 
     if global_step > 0 and last_saved_step != global_step:

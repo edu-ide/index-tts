@@ -27,7 +27,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 LR="${LR:-5e-6}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACC="${GRAD_ACC:-4}"  # Batch 8 * 4 = 32
-VAL_INTERVAL="${VAL_INTERVAL:-1000}" # Validate every 1000 steps
+VAL_INTERVAL="${VAL_INTERVAL:-100}" # Validate every 100 steps
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/mnt/sda1/models/IndexTTS-2/tokenizer_ko/ko_bpe.model}"
 NUM_WORKERS="${NUM_WORKERS:-32}"
 

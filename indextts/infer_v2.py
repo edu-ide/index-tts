@@ -607,6 +607,7 @@ class IndexTTS2:
                 #                     print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
                 #                     print(f"code len: {code_lens}")
 
+                min_code_len = int(os.getenv("MIN_CODE_LEN", "8"))
                 code_lens = []
                 max_code_len = 0
                 for code in codes:
@@ -615,6 +616,11 @@ class IndexTTS2:
                     else:
                         len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0]
                         code_len = len_[0].item() if len_.numel() > 0 else len(code)
+
+                    # guard against empty generation (stop at first token)
+                    if code_len < min_code_len:
+                        code_len = min_code_len
+
                     code_lens.append(code_len)
                     max_code_len = max(max_code_len, code_len)
 
@@ -631,6 +637,16 @@ class IndexTTS2:
                     max_code_len = tgt
 
                 codes = codes[:, :max_code_len]
+                if codes.shape[1] < max_code_len:
+                    # pad using last available token (or stop token if none)
+                    pad_tok = (
+                        codes[:, -1:]
+                        if codes.shape[1] > 0
+                        else torch.full((codes.size(0), 1), self.stop_mel_token, device=codes.device, dtype=codes.dtype)
+                    )
+                    pad = pad_tok.repeat(1, max_code_len - codes.shape[1])
+                    codes = torch.cat([codes, pad], dim=1)
+
                 code_lens = torch.LongTensor(code_lens).to(self.device)
                 if verbose:
                     print(codes, type(codes))

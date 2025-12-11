@@ -308,7 +308,8 @@ class UnifiedVoice(nn.Module):
                  train_solo_embeddings=False, use_mel_codes_as_input=True,
                  checkpointing=True, types=1,
                  condition_num_latent=32, condition_type="perceiver", condition_module=None, emo_condition_module=None, use_accel=False,
-                 enable_grl=False, num_speakers=500, grl_lambda=1.0):
+                 enable_grl=False, num_speakers=500, grl_lambda=1.0,
+                 emo_mel_input_size=None):
         """
         Args:
             layers: Number of layers in transformer stack.
@@ -328,8 +329,12 @@ class UnifiedVoice(nn.Module):
             use_mel_codes_as_input:
             checkpointing:
             condition_type: perceiver, gst or default encoder
+            emo_mel_input_size: If set (e.g., 80), creates emo_conditioning_encoder for mel input.
+                               Used in Stage 2 for proper gradient flow through emo encoder.
+                               None = use wav2vec2-bert input (1024 dim).
         """
         super().__init__()
+        self.emo_mel_input_size = emo_mel_input_size
         self.number_text_tokens = number_text_tokens
         self.start_text_token = start_text_token
         self.stop_text_token = stop_text_token
@@ -365,12 +370,24 @@ class UnifiedVoice(nn.Module):
         else:
             self.conditioning_encoder = ConditioningEncoder(1024, model_dim, num_attn_heads=heads, mean=True)
 
-        self.emo_conditioning_encoder = ConformerEncoder(input_size=1024,
+        # Stage 2: If emo_mel_input_size is set, use mel as input for emo encoder
+        # This allows proper gradient flow: audio -> mel -> emo_encoder -> GRL
+        emo_input_size = emo_mel_input_size if emo_mel_input_size is not None else 1024
+        emo_input_layer = emo_condition_module['input_layer']
+
+        # For Stage 2 mel input, override to use proper mel dimension
+        if emo_mel_input_size is not None:
+            print(f"[Stage 2] emo_conditioning_encoder: mel input (n_mels={emo_mel_input_size})")
+        else:
+            # For inference/Stage 1: use config's input_layer (conv2d2 for original model)
+            print(f"[Infer/Stage 1] emo_conditioning_encoder: input_layer={emo_input_layer}, dim={emo_input_size}")
+
+        self.emo_conditioning_encoder = ConformerEncoder(input_size=emo_input_size,
                                                          output_size=emo_condition_module['output_size'],
                                                          linear_units=emo_condition_module['linear_units'],
                                                          attention_heads=emo_condition_module['attention_heads'],
                                                          num_blocks=emo_condition_module['num_blocks'],
-                                                         input_layer=emo_condition_module['input_layer'])
+                                                         input_layer=emo_input_layer)
         self.emo_perceiver_encoder = PerceiverResampler(1024, dim_context=emo_condition_module['output_size'],
                                                             ff_mult=emo_condition_module['perceiver_mult'],
                                                             heads=emo_condition_module['attention_heads'],
