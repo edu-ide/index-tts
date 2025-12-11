@@ -1,4 +1,27 @@
+## Unofficial IndexTTS v2 Training Repo
+> Loop and trainer implemented using Codex CLI and guided prompts
+  - Train new languages by extending existing tokenizer
+    - tools\tokenizer\train_bpe.py and tools\tokenizer\extend_bpe.py
+  - Preprocess data to extract speaker embeddings for timbre, emotion, text, and mel tokens
+    - tools\preprocess_data.py and tools\preprocess_multiproc.py (multiproc is an attempt to make it run faster, there are issues with it though crashing)
+  - Create prompt/target pairs which is required for how IndexTTS2 trains in order to learn how to speak with speaker timbre while separating emotion (emotion has not yet been investigated)
+    - tools\generate_gpt_pairs.py
+  - Train/finetune the gpt model to learn to predict tokens for the language
+    - trainers\train_gpt_v2.py and train.bat
 
+The code here works and Japanese was *mostly* correct shown here: https://www.youtube.com/watch?v=47V7lS-HUpo (this model was trained on 1100 hours of audio for about 1.5 epochs)
+
+### Training References (Korean)
+
+- **전체 파이프라인 개요**: 토크나이저 확장 → 데이터 전처리 → 프롬프트/타깃 페어 생성 → GPT 미세조정 순으로 진행합니다. 관련 설명은 README 도입부와 `external/index-tts/README.md` 상단 요약을 참고하세요.
+- **환경 구축**: `docs/README_zh.md`의 “환경配置” 절(예: 123, 158, 188행 근처)이 uv 기반 가상환경, git-lfs, Hugging Face 자산 다운로드 절차를 상세히 다룹니다. 네트워크가 느릴 경우 HF 미러 설정(`docs/README_zh.md` 205행)을 권장합니다.
+- **토크나이저**: `tools/tokenizer/train_bpe.py`(12, 43행)으로 새 BPE를 학습하거나 `tools/tokenizer/extend_bpe.py`(1, 84행)로 기존 모델에 한국어 토큰을 추가할 수 있습니다.
+- **데이터 전처리**: `tools/preprocess_data.py`(9, 90, 421행)는 텍스트 정규화 → SeamlessM4T/Wav2Vec2 피처 추출 → MaskGCT 양자화 → GPT 기반 컨디셔닝·감정 벡터 추출을 수행하며, MaskGCT 가중치를 Hugging Face에서 받아옵니다(639행). 대용량 처리는 `tools/preprocess_multiproc.py`(1, 32, 98행)로 병렬 실행을 지원합니다.
+- **프롬프트/타깃 페어 생성**: `tools/build_gpt_prompt_pairs.py`(1, 68행)와 `tools/generate_gpt_pairs.py`(1, 74행)을 활용해 화자별 프롬프트·타깃 매니페스트(`gpt_pairs_*.jsonl`)를 생성합니다.
+- **GPT 미세조정**: `trainers/train_gpt_v2.py`(3, 46행)이 학습 진입점이며, 페어 매니페스트의 필수 필드 검증(200행)과 TensorBoard, 체크포인트 기록(585행)을 자동으로 처리합니다.
+- **필수 체크포인트**: `checkpoints/config.yaml`(14, 110행)이 참조하는 `gpt.pth`, `wav2vec2bert_stats.pt`, `s2mel.pth`, `feat1.pt`, `feat2.pt` 등을 Hugging Face `IndexTeam/IndexTTS-2`에서 내려받아 동일한 디렉터리 구조로 배치해야 합니다.
+
+The latest updates are done with a focus on training a multilingual model which shows promise, while mostly retaining the base model abilities to speak English and Chinese. Emotion finetuning has not been investigated yet and it seems that full finetuning does not mess up the base emotion capabilities of the model.
 
 <div align="center">
 <img src='assets/index_icon.png' width="250"/>
@@ -388,6 +411,127 @@ tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.
 > ```
 > 之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。
 > ```
+
+### 🚀 한국어 모델 빠른 실행 (Quick Start for Korean Model)
+
+한국어 모델 사용을 위한 편의 스크립트들입니다.
+
+#### 1. WebUI 서버 시작
+
+```bash
+./start_webui.sh
+```
+
+- **기능**: Gradio 기반 웹 인터페이스 실행
+- **서버 주소**: http://0.0.0.0:7860
+- **GPU**: RTX 3060 (12GB) 사용 (CUDA_VISIBLE_DEVICES=1)
+- **모델 위치**: ~/models/index-tts-ko/checkpoints
+- **모델 크기**: 3.3GB (추론 전용)
+
+#### 2. REST API 서버 시작
+
+```bash
+./start_api.sh
+```
+
+- **기능**: FastAPI 기반 REST API 서버 실행
+- **API 주소**: http://0.0.0.0:8765
+- **API 문서**: http://0.0.0.0:8765/docs
+- **GPU**: RTX 3060 (12GB) 사용 (CUDA_VISIBLE_DEVICES=1)
+
+**API 엔드포인트:**
+- `GET /`: Health check
+- `GET /health`: 모델 로딩 상태 확인
+- `POST /tts`: JSON 요청으로 TTS 생성 (Base64 인코딩된 오디오 반환)
+- `POST /tts_file`: Form 데이터로 TTS 생성 (WAV 파일 직접 반환)
+
+**API 사용 예제 (curl):**
+
+```bash
+# 기본 TTS 요청
+curl -X POST "http://localhost:8765/tts" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "안녕하세요, 반갑습니다!",
+    "prompt_audio_path": "examples/voice_busan.wav",
+    "temperature": 0.7,
+    "top_p": 0.9
+  }'
+
+# 파일로 직접 받기
+curl -X POST "http://localhost:8765/tts_file" \
+  -F "text=안녕하세요, 반갑습니다!" \
+  -F "prompt_audio=@examples/voice_busan.wav" \
+  -o output.wav
+```
+
+**Python 사용 예제:**
+
+```python
+import requests
+import base64
+
+# TTS 생성
+response = requests.post(
+    "http://localhost:8765/tts",
+    json={
+        "text": "안녕하세요, 반갑습니다!",
+        "prompt_audio_path": "examples/voice_busan.wav",
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "emo_weight": 1.0
+    }
+)
+
+result = response.json()
+
+# Base64 디코딩 후 저장
+audio_data = base64.b64decode(result["audio_base64"])
+with open("output.wav", "wb") as f:
+    f.write(audio_data)
+
+print(f"Duration: {result['duration']:.2f}s")
+print(f"Inference time: {result['inference_time']:.2f}s")
+```
+
+#### 3. 모델 업데이트
+
+```bash
+./update_model.sh
+```
+
+- **기능**: NFS에서 최신 `best_model.pth`를 가져와 추론용 모델로 자동 변환
+- **동작 과정**:
+  1. NFS (`/mnt/models/index-tts-ko/checkpoints/best_model.pth`)에서 최신 모델 확인
+  2. 타임스탬프 비교 후 필요시에만 복사 (최신이면 스킵)
+  3. 추론 전용 모델 추출 (7.3GB → 3.3GB, 54.9% 감소)
+  4. `gpt.pth` 심볼릭 링크 자동 업데이트
+
+- **사용 시점**: 학습 후 새 모델이 업데이트될 때마다
+- **참고**: 서버는 자동으로 재시작되지 않으므로, 업데이트 후 `start_webui.sh` 또는 `start_api.sh`를 다시 실행하세요
+
+#### 스크립트 권한 설정
+
+처음 사용 시 실행 권한을 부여하세요:
+
+```bash
+chmod +x start_webui.sh start_api.sh update_model.sh
+```
+
+#### 참조 오디오 추가
+
+WebUI 예제에 새로운 참조 오디오를 추가하려면:
+
+1. 오디오 파일을 `examples/` 디렉토리에 복사 (WAV 형식, 22050Hz, mono 권장)
+2. `examples/cases.jsonl` 파일에 항목 추가:
+
+```json
+{"prompt_audio":"your_audio.wav","text":"테스트 문장입니다.","emo_mode":0}
+```
+
+3. WebUI 재시작
+
+---
 
 ### Legacy: IndexTTS1 User Guide
 

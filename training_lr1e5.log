@@ -1,0 +1,8 @@
+2025-11-20 12:44:09,791 WETEXT INFO found existing fst: /mnt/sdc1/ws/workspace/monorepo/external/index-tts/indextts/utils/tagger_cache/zh_tn_tagger.fst
+2025-11-20 12:44:09,791 WETEXT INFO                     /mnt/sdc1/ws/workspace/monorepo/external/index-tts/indextts/utils/tagger_cache/zh_tn_verbalizer.fst
+2025-11-20 12:44:09,791 WETEXT INFO skip building fst for zh_normalizer ...
+2025-11-20 12:44:09,939 WETEXT INFO found existing fst: /mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/tn/en_tn_tagger.fst
+2025-11-20 12:44:09,939 WETEXT INFO                     /mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/tn/en_tn_verbalizer.fst
+2025-11-20 12:44:09,939 WETEXT INFO skip building fst for en_normalizer ...
+/mnt/sdc1/ws/workspace/.venv_indextts/lib/python3.10/site-packages/transformers/configuration_utils.py:312: UserWarning: Passing `gradient_checkpointing` to a config initialization is deprecated and will be removed in v5 Transformers. Using `model.gradient_checkpointing_enable()` instead, or if you are using the `Trainer` API, pass `gradient_checkpointing=True` in your `TrainingArguments`.
+  warnings.warn(

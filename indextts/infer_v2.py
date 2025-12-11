@@ -38,7 +38,8 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
+            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False,
+            gpt_ckpt_override: str | None = None
     ):
         """
         Args:
@@ -83,7 +84,9 @@ class IndexTTS2:
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        self.gpt_path = gpt_ckpt_override if gpt_ckpt_override else os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        if gpt_ckpt_override and not os.path.exists(self.gpt_path):
+            raise FileNotFoundError(f"Specified gpt checkpoint not found: {self.gpt_path}")
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
@@ -352,14 +355,16 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
+              target_codes=None, target_frames=None, **generation_kwargs):
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                target_codes=target_codes, target_frames=target_frames, **generation_kwargs
             )
         else:
             try:
@@ -368,7 +373,8 @@ class IndexTTS2:
                     emo_audio_prompt, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                    target_codes=target_codes, target_frames=target_frames, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -377,7 +383,8 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
+              target_codes=None, target_frames=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -417,6 +424,16 @@ class IndexTTS2:
             emo_audio_prompt = spk_audio_prompt
             # must always use alpha=1.0 when we don't have an external reference voice
             emo_alpha = 1.0
+
+        # Validate speaker prompt
+        if spk_audio_prompt:
+            if not os.path.exists(spk_audio_prompt):
+                print(f">> Error: Speaker prompt file not found: {spk_audio_prompt}")
+            else:
+                if verbose:
+                    print(f">> Using speaker prompt: {spk_audio_prompt}")
+        else:
+            print(">> Warning: No speaker prompt provided!")
 
         # 如果参考音频改变了，才需要重新生成, 提升速度
         if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
@@ -600,9 +617,21 @@ class IndexTTS2:
                         code_len = len_[0].item() if len_.numel() > 0 else len(code)
                     code_lens.append(code_len)
                     max_code_len = max(max_code_len, code_len)
+
+                # Optional duration override (semantic token count)
+                if target_codes is not None:
+                    tgt = int(target_codes)
+                    if tgt < max_code_len:
+                        codes = codes[:, :tgt]
+                    elif tgt > max_code_len:
+                        pad_len = tgt - max_code_len
+                        pad_tok = codes[:, -1:].repeat(1, pad_len)
+                        codes = torch.cat([codes, pad_tok], dim=1)
+                    code_lens = [tgt for _ in code_lens]
+                    max_code_len = tgt
+
                 codes = codes[:, :max_code_len]
-                code_lens = torch.LongTensor(code_lens)
-                code_lens = code_lens.to(self.device)
+                code_lens = torch.LongTensor(code_lens).to(self.device)
                 if verbose:
                     print(codes, type(codes))
                     print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
@@ -633,8 +662,18 @@ class IndexTTS2:
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
-                    S_infer = S_infer + latent
-                    target_lengths = (code_lens * 1.72).long()
+                    fusion_prob = float(os.getenv("S2M_GPT_FUSION_PROB", "0.5"))
+                    if torch.rand(1).item() < fusion_prob:
+                        S_infer = S_infer + latent
+                        if verbose:
+                            print(f"[S2M] GPT latent fusion applied (p={fusion_prob})")
+                    elif verbose:
+                        print(f"[S2M] GPT latent fusion skipped (p={fusion_prob})")
+
+                    if target_frames is not None:
+                        target_lengths = torch.LongTensor([int(target_frames)] * code_lens.size(0)).to(self.device)
+                    else:
+                        target_lengths = (code_lens * 1.72).long()
 
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,

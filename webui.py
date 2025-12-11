@@ -11,6 +11,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import pandas as pd
+import torch
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -24,31 +25,42 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
-parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
+parser.add_argument("--model_dir", type=str, default="/mnt/sda1/models/index-tts-ko/checkpoints", help="Model checkpoints directory")
 parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
 parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
 parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
 parser.add_argument("--gui_seg_tokens", type=int, default=120, help="GUI: Max tokens per generation segment")
+parser.add_argument("--gpt_ckpt", type=str, default=None, help="Override GPT checkpoint path (e.g., best_model_stepXXXXX.pth)")
 cmd_args = parser.parse_args()
 
 if not os.path.exists(cmd_args.model_dir):
     print(f"Model directory {cmd_args.model_dir} does not exist. Please download the model first.")
     sys.exit(1)
 
-for file in [
+required_files = [
     "bpe.model",
-    "gpt.pth",
     "config.yaml",
     "s2mel.pth",
-    "wav2vec2bert_stats.pt"
-]:
+    "wav2vec2bert_stats.pt",
+]
+
+# gpt checkpoint can be overridden; only check default file if override not provided
+if cmd_args.gpt_ckpt is None:
+    required_files.append("gpt.pth")
+
+for file in required_files:
     file_path = os.path.join(cmd_args.model_dir, file)
     if not os.path.exists(file_path):
         print(f"Required file {file_path} does not exist. Please download it.")
         sys.exit(1)
 
+if cmd_args.gpt_ckpt and not os.path.exists(cmd_args.gpt_ckpt):
+    print(f"Specified gpt checkpoint not found: {cmd_args.gpt_ckpt}")
+    sys.exit(1)
+
 import gradio as gr
 from indextts.infer_v2 import IndexTTS2
+from indextts.utils.checkpoint import load_checkpoint
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language="Auto")
@@ -58,7 +70,38 @@ tts = IndexTTS2(model_dir=cmd_args.model_dir,
                 use_fp16=cmd_args.fp16,
                 use_deepspeed=cmd_args.deepspeed,
                 use_cuda_kernel=cmd_args.cuda_kernel,
+                gpt_ckpt_override=cmd_args.gpt_ckpt,
                 )
+default_gpt_ckpt = cmd_args.gpt_ckpt or os.path.join(cmd_args.model_dir, "gpt.pth")
+
+
+def load_gpt_checkpoint(file_path, path_text):
+    # file_path from gr.File(type="filepath") or None
+    chosen = None
+    if file_path:
+        chosen = file_path
+    elif path_text:
+        chosen = path_text.strip()
+    else:
+        chosen = default_gpt_ckpt
+
+    if not chosen:
+        return path_text, "⚠️ 경로가 비어 있습니다."
+    if not os.path.exists(chosen):
+        return path_text, f"❌ 파일을 찾을 수 없습니다: {chosen}"
+
+    try:
+        load_checkpoint(tts.gpt, chosen)
+        tts.gpt = tts.gpt.to(tts.device)
+        if tts.use_fp16:
+            tts.gpt.eval().half()
+        else:
+            tts.gpt.eval()
+        tts.gpt_path = chosen
+    except Exception as e:
+        return path_text, f"❌ 로드 실패: {e}"
+
+    return chosen, f"✅ GPT checkpoint 로드 완료: {chosen}"
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
@@ -180,6 +223,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 <a href='https://arxiv.org/abs/2506.21619'><img src='https://img.shields.io/badge/ArXiv-2506.21619-red'></a>
 </p>
     ''')
+
+    with gr.Row():
+        ckpt_file = gr.File(label="GPT checkpoint (.pth)", type="filepath", file_types=[".pth"], height=60)
+        ckpt_path = gr.Textbox(label="GPT checkpoint path", value=default_gpt_ckpt, lines=1)
+        load_btn = gr.Button("Load checkpoint", variant="primary")
+    ckpt_status = gr.Markdown(value="")
+    load_btn.click(load_gpt_checkpoint, inputs=[ckpt_file, ckpt_path], outputs=[ckpt_path, ckpt_status])
 
     with gr.Tab(i18n("音频生成")):
         with gr.Row():
