@@ -425,6 +425,16 @@ class IndexTTS2:
             # must always use alpha=1.0 when we don't have an external reference voice
             emo_alpha = 1.0
 
+        # Validate speaker prompt
+        if spk_audio_prompt:
+            if not os.path.exists(spk_audio_prompt):
+                print(f">> Error: Speaker prompt file not found: {spk_audio_prompt}")
+            else:
+                if verbose:
+                    print(f">> Using speaker prompt: {spk_audio_prompt}")
+        else:
+            print(">> Warning: No speaker prompt provided!")
+
         # 如果参考音频改变了，才需要重新生成, 提升速度
         if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
             if self.cache_spk_cond is not None:

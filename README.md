@@ -412,6 +412,127 @@ tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.
 > 之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。
 > ```
 
+### 🚀 한국어 모델 빠른 실행 (Quick Start for Korean Model)
+
+한국어 모델 사용을 위한 편의 스크립트들입니다.
+
+#### 1. WebUI 서버 시작
+
+```bash
+./start_webui.sh
+```
+
+- **기능**: Gradio 기반 웹 인터페이스 실행
+- **서버 주소**: http://0.0.0.0:7860
+- **GPU**: RTX 3060 (12GB) 사용 (CUDA_VISIBLE_DEVICES=1)
+- **모델 위치**: ~/models/index-tts-ko/checkpoints
+- **모델 크기**: 3.3GB (추론 전용)
+
+#### 2. REST API 서버 시작
+
+```bash
+./start_api.sh
+```
+
+- **기능**: FastAPI 기반 REST API 서버 실행
+- **API 주소**: http://0.0.0.0:8765
+- **API 문서**: http://0.0.0.0:8765/docs
+- **GPU**: RTX 3060 (12GB) 사용 (CUDA_VISIBLE_DEVICES=1)
+
+**API 엔드포인트:**
+- `GET /`: Health check
+- `GET /health`: 모델 로딩 상태 확인
+- `POST /tts`: JSON 요청으로 TTS 생성 (Base64 인코딩된 오디오 반환)
+- `POST /tts_file`: Form 데이터로 TTS 생성 (WAV 파일 직접 반환)
+
+**API 사용 예제 (curl):**
+
+```bash
+# 기본 TTS 요청
+curl -X POST "http://localhost:8765/tts" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "안녕하세요, 반갑습니다!",
+    "prompt_audio_path": "examples/voice_busan.wav",
+    "temperature": 0.7,
+    "top_p": 0.9
+  }'
+
+# 파일로 직접 받기
+curl -X POST "http://localhost:8765/tts_file" \
+  -F "text=안녕하세요, 반갑습니다!" \
+  -F "prompt_audio=@examples/voice_busan.wav" \
+  -o output.wav
+```
+
+**Python 사용 예제:**
+
+```python
+import requests
+import base64
+
+# TTS 생성
+response = requests.post(
+    "http://localhost:8765/tts",
+    json={
+        "text": "안녕하세요, 반갑습니다!",
+        "prompt_audio_path": "examples/voice_busan.wav",
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "emo_weight": 1.0
+    }
+)
+
+result = response.json()
+
+# Base64 디코딩 후 저장
+audio_data = base64.b64decode(result["audio_base64"])
+with open("output.wav", "wb") as f:
+    f.write(audio_data)
+
+print(f"Duration: {result['duration']:.2f}s")
+print(f"Inference time: {result['inference_time']:.2f}s")
+```
+
+#### 3. 모델 업데이트
+
+```bash
+./update_model.sh
+```
+
+- **기능**: NFS에서 최신 `best_model.pth`를 가져와 추론용 모델로 자동 변환
+- **동작 과정**:
+  1. NFS (`/mnt/models/index-tts-ko/checkpoints/best_model.pth`)에서 최신 모델 확인
+  2. 타임스탬프 비교 후 필요시에만 복사 (최신이면 스킵)
+  3. 추론 전용 모델 추출 (7.3GB → 3.3GB, 54.9% 감소)
+  4. `gpt.pth` 심볼릭 링크 자동 업데이트
+
+- **사용 시점**: 학습 후 새 모델이 업데이트될 때마다
+- **참고**: 서버는 자동으로 재시작되지 않으므로, 업데이트 후 `start_webui.sh` 또는 `start_api.sh`를 다시 실행하세요
+
+#### 스크립트 권한 설정
+
+처음 사용 시 실행 권한을 부여하세요:
+
+```bash
+chmod +x start_webui.sh start_api.sh update_model.sh
+```
+
+#### 참조 오디오 추가
+
+WebUI 예제에 새로운 참조 오디오를 추가하려면:
+
+1. 오디오 파일을 `examples/` 디렉토리에 복사 (WAV 형식, 22050Hz, mono 권장)
+2. `examples/cases.jsonl` 파일에 항목 추가:
+
+```json
+{"prompt_audio":"your_audio.wav","text":"테스트 문장입니다.","emo_mode":0}
+```
+
+3. WebUI 재시작
+
+---
+
 ### Legacy: IndexTTS1 User Guide
 
 You can also use our previous IndexTTS1 model by importing a different module:
